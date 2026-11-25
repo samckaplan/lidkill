@@ -25,8 +25,10 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let iconURL = Bundle.main.url(forResource: "Lidkill", withExtension: "png"),
-           let icon = NSImage(contentsOf: iconURL) {
-            icon.size = NSSize(width: 24, height: 22)
+           let asset = NSImage(contentsOf: iconURL),
+           let source = asset.cgImage(forProposedRect: nil, context: nil, hints: nil),
+           let glyph = source.copy(maskingColorComponents: [128, 255, 128, 255, 128, 255]) {
+            let icon = NSImage(cgImage: glyph, size: NSSize(width: 17, height: 17))
             icon.isTemplate = true
             statusItem.button?.image = icon
             statusItem.button?.imagePosition = .imageLeading
