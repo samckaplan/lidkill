@@ -6,7 +6,7 @@
 #   lidkill off                disarm it
 #   lidkill status             show what is going on
 #   lidkill mode hard          poweroff | reboot | hard | nuke
-#   lidkill test               20s dry run
+#   lidkill test [seconds]     timed dry run
 #   lidkill uninstall          remove everything
 #
 # Requires: macOS on Apple Silicon (or Intel), bash, ioreg, pmset.
@@ -60,8 +60,9 @@ Usage: lidkill <command>
   mode <m>             poweroff (default) | reboot | hard | nuke
   delay <seconds>      how long the lid must stay shut before firing
   dryrun <on|off>      log what would happen without killing anything
-  test                 watch the lid for 20s in dry-run mode
-  logs                 tail the watcher log
+  test [seconds]       watch the lid in dry-run mode (default: 20s)
+  logs [lines]         tail the watcher log (default: 40 lines)
+  logs --follow        stream new watcher log entries
   uninstall            remove everything and restore normal sleep
 
 Modes:
@@ -90,9 +91,9 @@ set_cfg() {
     mkdir -p "$(dirname "$CFG")" || die "cannot create $(dirname "$CFG")"
     [ -f "$CFG" ] || : >"$CFG"
     if grep -q "^${key}=" "$CFG" 2>/dev/null; then
-        /usr/bin/sed -i '' "s|^${key}=.*|${key}=${val}|" "$CFG"
+        /usr/bin/sed -i '' "s|^${key}=.*|${key}=${val}|" "$CFG" || die "cannot update $CFG"
     else
-        printf '%s=%s\n' "$key" "$val" >>"$CFG"
+        printf '%s=%s\n' "$key" "$val" >>"$CFG" || die "cannot update $CFG"
     fi
 }
 
@@ -115,11 +116,6 @@ agent_loaded() {
     launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
 }
 
-agent_pid() {
-    launchctl print "$DOMAIN/$LABEL" 2>/dev/null \
-        | /usr/bin/awk '/^[[:space:]]*pid = / {print $3; exit}'
-}
-
 is_installed() {
     [ -f "$APP_DIR/watcher.sh" ] && [ -f "$AGENT" ]
 }
@@ -132,7 +128,7 @@ need_sudo() {
 # ---------------------------------------------------------------- commands
 
 cmd_install() {
-    local assets
+    local assets helper
     if [ -f "$SRC/watcher.sh" ] && [ -f "$SRC/com.lidkill.watcher.plist" ]; then
         assets="$SRC"
     elif [ -f "$APP_DIR/watcher.sh" ] && [ -f "$APP_DIR/com.lidkill.watcher.plist" ]; then
@@ -148,6 +144,24 @@ cmd_install() {
     [ "$assets/watcher.sh" -ef "$APP_DIR/watcher.sh" ] \
         || /usr/bin/install -m 0755 "$assets/watcher.sh" "$APP_DIR/watcher.sh" \
         || die "cannot install watcher"
+
+    if [ -f "$assets/lid-events.c" ] && ! [ "$assets/lid-events.c" -ef "$APP_DIR/lid-events.c" ]; then
+        /usr/bin/install -m 0644 "$assets/lid-events.c" "$APP_DIR/lid-events.c" \
+            || die "cannot store the lid event monitor source"
+    fi
+
+    if [ -f "$APP_DIR/lid-events.c" ] && /usr/bin/xcode-select -p >/dev/null 2>&1 \
+        && /usr/bin/xcrun --find clang >/dev/null 2>&1; then
+        helper=$(mktemp "$APP_DIR/.lid-events.XXXXXX") || die "mktemp failed"
+        if /usr/bin/xcrun --sdk macosx clang -O2 -Wall -Wextra -framework IOKit -framework CoreFoundation \
+            "$APP_DIR/lid-events.c" -o "$helper" && chmod 0755 "$helper" \
+            && mv -f "$helper" "$APP_DIR/lid-events"; then
+            ok "IOKit lid event monitor ready."
+        else
+            rm -f "$helper"
+            warn "could not build the IOKit monitor; the watcher can use polling"
+        fi
+    fi
 
     [ "$assets/com.lidkill.watcher.plist" -ef "$APP_DIR/com.lidkill.watcher.plist" ] \
         || /usr/bin/install -m 0644 "$assets/com.lidkill.watcher.plist" \
@@ -204,8 +218,7 @@ cmd_on() {
 
     if [ "$(lid_state)" = closed ] && [ "$force" -ne 1 ]; then
         warn "the lid is closed RIGHT NOW."
-        echo "Arming would power this machine off within ${DELAY}s."
-        echo "Re-run with --force if that is what you want."
+        echo "Re-run with --force to arm anyway. Open and close the lid to trigger it."
         exit 1
     fi
 
@@ -234,8 +247,6 @@ EOF
     launchctl bootstrap "$DOMAIN" "$AGENT" >/dev/null 2>&1 \
         || launchctl load -w "$AGENT" >/dev/null 2>&1 \
         || die "could not load the LaunchAgent"
-    launchctl kickstart -k "$DOMAIN/$LABEL" >/dev/null 2>&1
-
     sleep 1
     if ! agent_loaded; then
         die "the LaunchAgent did not stay loaded - check $LOG"
@@ -264,13 +275,14 @@ cmd_off() {
 
 cmd_status() {
     load_cfg
-    local lid sd pid
+    local lid sd job pid
     lid=$(lid_state)
     sd=$(sleep_disabled)
-    pid=$(agent_pid)
+    job=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null) || job=
+    pid=$(printf '%s\n' "$job" | /usr/bin/awk '/^[[:space:]]*pid = / {print $3; exit}')
 
     echo "${B}lidkill${N}"
-    if is_installed && agent_loaded; then
+    if is_installed && [ -n "$job" ]; then
         echo "  state        ${G}ARMED${N}"
     elif is_installed; then
         echo "  state        ${D}off${N} (installed, watcher not running)"
@@ -285,6 +297,13 @@ cmd_status() {
         printf '  watcher      running (pid %s)\n' "$pid"
     else
         printf '  watcher      not running\n'
+    fi
+    if is_installed; then
+        if [ -x "$APP_DIR/lid-events" ]; then
+            printf '  detector     IOKit available (polling fallback)\n'
+        else
+            printf '  detector     polling\n'
+        fi
     fi
     printf '  SleepDisabled %s   %s\n' "${sd:-?}" "$([ "${sd:-0}" = 1 ] && echo '(Mac stays awake with lid shut)' || echo '(normal: lid close sleeps)')"
     if [ -f "$SUDOERS" ]; then
@@ -310,7 +329,6 @@ cmd_mode() {
         hard) echo "halt -q: ungraceful, but the filesystem cache is still flushed." ;;
         nuke) warn "halt -nq: no cache flush. Unsaved work and filesystem damage are possible." ;;
     esac
-    agent_loaded && echo "(applies within ~30s, or run: lidkill off && lidkill on)"
     return 0
 }
 
@@ -331,22 +349,36 @@ cmd_dryrun() {
 
 cmd_test() {
     is_installed || die "not installed yet - run: $SELF install"
-    echo "Watching the lid for 20 seconds in DRY-RUN mode - nothing will be shut down."
+    local duration="${1:-20}" pid timer
+    case "$duration" in ''|*[!0-9]*) die "test duration must be 1-300 seconds" ;; esac
+    [ "$duration" -ge 1 ] && [ "$duration" -le 300 ] || die "test duration must be 1-300 seconds"
+    load_cfg
+    if agent_loaded && [ "$DRYRUN" != 1 ]; then
+        die "armed watcher can still shut down this Mac; run lidkill dryrun on before testing"
+    fi
+    echo "Watching the lid in DRY-RUN mode for ${duration}s."
     echo "${D}Note: a lid close is only detectable while armed (sleep disabled).${N}"
     echo
     LIDKILL_CONFIG="$CFG" LIDKILL_DRYRUN=1 LIDKILL_LOG="$LOG" \
         /bin/bash "$APP_DIR/watcher.sh" &
-    local pid=$!
-    sleep 20
+    pid=$!
+    sleep "$duration" &
+    timer=$!
+    trap 'kill "$pid" "$timer" 2>/dev/null; wait "$pid" "$timer" 2>/dev/null; exit 130' INT TERM
+    wait "$timer"
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
+    trap - INT TERM
     echo "--- log ---"
     tail -n 10 "$LOG" 2>/dev/null
 }
 
 cmd_logs() {
     [ -f "$LOG" ] || die "no log yet at $LOG"
-    tail -n "${1:-40}" "$LOG"
+    case "${1:-}" in
+        --follow|-f) exec tail -n 40 -F "$LOG" ;;
+        *) exec tail -n "${1:-40}" "$LOG" ;;
+    esac
 }
 
 cmd_uninstall() {
@@ -378,7 +410,7 @@ case "$cmd" in
     mode)               cmd_mode "$@" ;;
     delay)              cmd_delay "$@" ;;
     dryrun)             cmd_dryrun "$@" ;;
-    test)               cmd_test ;;
+    test)               cmd_test "$@" ;;
     logs|log)           cmd_logs "$@" ;;
     uninstall|remove)   cmd_uninstall ;;
     ''|help|-h|--help)  usage ;;
