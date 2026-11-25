@@ -1,0 +1,386 @@
+#!/bin/bash
+# lidkill - make closing the lid power the machine off (or reboot it).
+#
+#   lidkill install            copy the pieces into place (no sudo)
+#   lidkill on                 arm it (asks for your password once)
+#   lidkill off                disarm it
+#   lidkill status             show what is going on
+#   lidkill mode hard          poweroff | reboot | hard | nuke
+#   lidkill test               20s dry run
+#   lidkill uninstall          remove everything
+#
+# Requires: macOS on Apple Silicon (or Intel), bash, ioreg, pmset.
+
+set -uo pipefail
+
+LABEL="com.lidkill.watcher"
+APP_DIR="$HOME/Library/Application Support/lidkill"
+BIN_DIR="$HOME/.local/bin"
+BIN="$BIN_DIR/lidkill"
+AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
+CFG="$HOME/.config/lidkill/config"
+LOG="$HOME/Library/Logs/lidkill.log"
+SUDOERS="/etc/sudoers.d/lidkill"
+DOMAIN="gui/$(id -u)"
+
+MODE=poweroff
+DELAY=1
+DRYRUN=0
+
+if [ -t 1 ]; then
+    B=$'\033[1m'; D=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; N=$'\033[0m'
+else
+    B=''; D=''; R=''; G=''; Y=''; N=''
+fi
+
+# ---------------------------------------------------------------- helpers
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    _d="$(cd -P "$(dirname "$SELF")" && pwd)"
+    SELF="$(readlink "$SELF")"
+    case "$SELF" in /*) ;; *) SELF="$_d/$SELF" ;; esac
+done
+SRC="$(cd -P "$(dirname "$SELF")" && pwd)"
+
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*"; }
+ok()   { printf '%s%s%s\n' "$G" "$*" "$N"; }
+
+usage() {
+    cat <<EOF
+${B}lidkill${N} - closing the lid powers the machine off.
+
+Usage: lidkill <command>
+
+  install              copy the watcher + LaunchAgent into place (no sudo)
+  on [--force]         arm: keep awake with the lid shut, start the watcher
+  off                  disarm: unload the watcher, restore normal lid sleep
+  status               show lid, mode, watcher and sleep state
+  mode <m>             poweroff (default) | reboot | hard | nuke
+  delay <seconds>      how long the lid must stay shut before firing
+  dryrun <on|off>      log what would happen without killing anything
+  test                 watch the lid for 20s in dry-run mode
+  logs                 tail the watcher log
+  uninstall            remove everything and restore normal sleep
+
+Modes:
+  poweroff   /sbin/shutdown -h now    clean power off
+  reboot     /sbin/shutdown -r now    clean reboot
+  hard       /sbin/halt -q            ungraceful, cache still flushed
+  nuke       /sbin/halt -nq           no flush at all, data loss possible
+
+Installed at: $BIN
+Log:          $LOG
+EOF
+}
+
+load_cfg() {
+    MODE=poweroff
+    DELAY=1
+    DRYRUN=0
+    if [ -r "$CFG" ]; then
+        # shellcheck disable=SC1090
+        . "$CFG"
+    fi
+}
+
+set_cfg() {
+    local key="$1" val="$2"
+    mkdir -p "$(dirname "$CFG")" || die "cannot create $(dirname "$CFG")"
+    [ -f "$CFG" ] || : >"$CFG"
+    if grep -q "^${key}=" "$CFG" 2>/dev/null; then
+        /usr/bin/sed -i '' "s|^${key}=.*|${key}=${val}|" "$CFG"
+    else
+        printf '%s=%s\n' "$key" "$val" >>"$CFG"
+    fi
+}
+
+lid_state() {
+    local raw
+    raw=$(/usr/sbin/ioreg -r -k AppleClamshellState -d 4 2>/dev/null \
+        | /usr/bin/awk -F' = ' '/"AppleClamshellState"/ {gsub(/[^A-Za-z0-9]/, "", $2); print $2; exit}')
+    case "$raw" in
+        Yes|1) echo closed ;;
+        No|0)  echo open ;;
+        *)     echo unknown ;;
+    esac
+}
+
+sleep_disabled() {
+    /usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/ {print $2; exit}'
+}
+
+agent_loaded() {
+    launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+agent_pid() {
+    launchctl print "$DOMAIN/$LABEL" 2>/dev/null \
+        | /usr/bin/awk '/^[[:space:]]*pid = / {print $3; exit}'
+}
+
+is_installed() {
+    [ -f "$APP_DIR/watcher.sh" ] && [ -f "$AGENT" ]
+}
+
+need_sudo() {
+    [ -n "${1:-}" ] && echo "$1"
+    /usr/bin/sudo -v || die "sudo was cancelled or failed"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_install() {
+    local assets
+    if [ -f "$SRC/watcher.sh" ] && [ -f "$SRC/com.lidkill.watcher.plist" ]; then
+        assets="$SRC"
+    elif [ -f "$APP_DIR/watcher.sh" ] && [ -f "$APP_DIR/com.lidkill.watcher.plist" ]; then
+        # Re-installing from the copy in ~/.local/bin: use the stored assets.
+        assets="$APP_DIR"
+    else
+        die "install assets not found (looked in $SRC and $APP_DIR)"
+    fi
+
+    mkdir -p "$APP_DIR" "$BIN_DIR" "$HOME/Library/LaunchAgents" \
+             "$(dirname "$CFG")" "$(dirname "$LOG")" || die "mkdir failed"
+
+    [ "$assets/watcher.sh" -ef "$APP_DIR/watcher.sh" ] \
+        || /usr/bin/install -m 0755 "$assets/watcher.sh" "$APP_DIR/watcher.sh" \
+        || die "cannot install watcher"
+
+    [ "$assets/com.lidkill.watcher.plist" -ef "$APP_DIR/com.lidkill.watcher.plist" ] \
+        || /usr/bin/install -m 0644 "$assets/com.lidkill.watcher.plist" \
+               "$APP_DIR/com.lidkill.watcher.plist" \
+        || die "cannot store the plist template"
+
+    /usr/bin/sed -e "s|__WATCHER__|$APP_DIR/watcher.sh|g" \
+                 -e "s|__LOG__|$LOG|g" \
+                 -e "s|__HOME__|$HOME|g" \
+                 "$APP_DIR/com.lidkill.watcher.plist" >"$AGENT" || die "cannot write LaunchAgent"
+    chmod 0644 "$AGENT"
+    /usr/bin/plutil -lint "$AGENT" >/dev/null || die "generated LaunchAgent is not valid"
+
+    if [ ! -f "$CFG" ]; then
+        cat >"$CFG" <<'EOF'
+# lidkill settings
+# MODE: poweroff | reboot | hard | nuke
+MODE=poweroff
+# seconds the lid must stay closed before firing
+DELAY=1
+# 1 = only log what would happen, never kill
+DRYRUN=0
+EOF
+    fi
+
+    [ "$SELF" -ef "$BIN" ] || /usr/bin/install -m 0755 "$SELF" "$BIN" || die "cannot install $BIN"
+
+    if [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+        ln -sf "$BIN" /usr/local/bin/lidkill 2>/dev/null || true
+    fi
+
+    ok "installed."
+    echo
+    echo "  binary   $BIN"
+    echo "  watcher  $APP_DIR/watcher.sh"
+    echo "  agent    $AGENT"
+    echo "  config   $CFG"
+    echo "  log      $LOG"
+    echo
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *)  printf '  %s%s is not on your PATH yet. Add it once:%s\n' "$D" "$BIN_DIR" "$N"
+            echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec zsh"
+            echo ;;
+    esac
+    printf '\n  Arm it with:  %s on\n' "$BIN"
+}
+
+cmd_on() {
+    local force=0
+    [ "${1:-}" = "--force" ] && force=1
+    is_installed || die "not installed yet - run: $SELF install"
+    load_cfg
+
+    if [ "$(lid_state)" = closed ] && [ "$force" -ne 1 ]; then
+        warn "the lid is closed RIGHT NOW."
+        echo "Arming would power this machine off within ${DELAY}s."
+        echo "Re-run with --force if that is what you want."
+        exit 1
+    fi
+
+    echo "Arming lidkill. Your password is needed once to:"
+    echo "  1. allow the watcher to call shutdown without a prompt (${SUDOERS})"
+    echo "  2. keep the Mac awake while the lid is shut (pmset disablesleep 1)"
+    echo
+    need_sudo ""
+
+    local tmp
+    tmp=$(mktemp) || die "mktemp failed"
+    cat >"$tmp" <<EOF
+# Managed by lidkill. Allows the lid watcher to power off / reboot without a prompt.
+$(id -un) ALL=(root) NOPASSWD: /sbin/shutdown -h now, /sbin/shutdown -r now, /sbin/halt -q, /sbin/halt -nq
+EOF
+
+    /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "sudoers syntax check failed"; }
+    /usr/bin/sudo /usr/bin/install -m 0440 -o root -g wheel "$tmp" "$SUDOERS" \
+        || { rm -f "$tmp"; die "cannot install $SUDOERS"; }
+    rm -f "$tmp"
+
+    /usr/bin/sudo /usr/bin/pmset -a disablesleep 1 || die "pmset -a disablesleep 1 failed"
+
+    launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1
+    launchctl enable "$DOMAIN/$LABEL" >/dev/null 2>&1
+    launchctl bootstrap "$DOMAIN" "$AGENT" >/dev/null 2>&1 \
+        || launchctl load -w "$AGENT" >/dev/null 2>&1 \
+        || die "could not load the LaunchAgent"
+    launchctl kickstart -k "$DOMAIN/$LABEL" >/dev/null 2>&1
+
+    sleep 1
+    if ! agent_loaded; then
+        die "the LaunchAgent did not stay loaded - check $LOG"
+    fi
+
+    ok "ARMED. Closing the lid will now run: ${MODE}"
+    [ "$DRYRUN" = 1 ] && warn "dry-run is ON - it will only log, not kill"
+    echo
+    echo "Disarm with: $BIN off"
+}
+
+cmd_off() {
+    if agent_loaded; then
+        launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+            || launchctl unload -w "$AGENT" >/dev/null 2>&1
+        echo "watcher unloaded"
+    else
+        echo "watcher was not loaded"
+    fi
+
+    need_sudo "Restoring normal lid sleep needs your password."
+    /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || die "pmset failed"
+    ok "DISARMED. Lid close sleeps normally again."
+    echo "SleepDisabled = $(sleep_disabled)"
+}
+
+cmd_status() {
+    load_cfg
+    local lid sd pid
+    lid=$(lid_state)
+    sd=$(sleep_disabled)
+    pid=$(agent_pid)
+
+    echo "${B}lidkill${N}"
+    if is_installed && agent_loaded; then
+        echo "  state        ${G}ARMED${N}"
+    elif is_installed; then
+        echo "  state        ${D}off${N} (installed, watcher not running)"
+    else
+        echo "  state        ${D}not installed${N}"
+    fi
+    printf '  lid          %s\n' "$lid"
+    printf '  mode         %s\n' "$MODE"
+    printf '  delay        %ss\n' "$DELAY"
+    printf '  dry-run      %s\n' "$([ "$DRYRUN" = 1 ] && echo yes || echo no)"
+    if [ -n "$pid" ]; then
+        printf '  watcher      running (pid %s)\n' "$pid"
+    else
+        printf '  watcher      not running\n'
+    fi
+    printf '  SleepDisabled %s   %s\n' "${sd:-?}" "$([ "${sd:-0}" = 1 ] && echo '(Mac stays awake with lid shut)' || echo '(normal: lid close sleeps)')"
+    if [ -f "$SUDOERS" ]; then
+        printf '  sudoers      present\n'
+    else
+        printf '  sudoers      %smissing%s\n' "$R" "$N"
+    fi
+    if [ -f "$LOG" ]; then
+        echo
+        echo "${D}last log lines:${N}"
+        tail -n 5 "$LOG" | sed 's/^/  /'
+    fi
+}
+
+cmd_mode() {
+    case "${1:-}" in
+        poweroff|reboot|hard|nuke) ;;
+        *) die "mode must be one of: poweroff, reboot, hard, nuke" ;;
+    esac
+    set_cfg MODE "$1"
+    ok "mode = $1"
+    case "$1" in
+        hard) echo "halt -q: ungraceful, but the filesystem cache is still flushed." ;;
+        nuke) warn "halt -nq: no cache flush. Unsaved work and filesystem damage are possible." ;;
+    esac
+    agent_loaded && echo "(applies within ~30s, or run: lidkill off && lidkill on)"
+    return 0
+}
+
+cmd_delay() {
+    case "${1:-}" in ''|*[!0-9]*) die "delay must be a whole number of seconds" ;; esac
+    [ "$1" -le 60 ] || die "delay must be 60 seconds or less"
+    set_cfg DELAY "$1"
+    ok "delay = ${1}s"
+}
+
+cmd_dryrun() {
+    case "${1:-}" in
+        on|1|yes)  set_cfg DRYRUN 1; ok "dry-run on (log only)" ;;
+        off|0|no)  set_cfg DRYRUN 0; ok "dry-run off (will really kill)" ;;
+        *) die "usage: lidkill dryrun <on|off>" ;;
+    esac
+}
+
+cmd_test() {
+    is_installed || die "not installed yet - run: $SELF install"
+    echo "Watching the lid for 20 seconds in DRY-RUN mode - nothing will be shut down."
+    echo "${D}Note: a lid close is only detectable while armed (sleep disabled).${N}"
+    echo
+    LIDKILL_CONFIG="$CFG" LIDKILL_DRYRUN=1 LIDKILL_LOG="$LOG" \
+        /bin/bash "$APP_DIR/watcher.sh" &
+    local pid=$!
+    sleep 20
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    echo "--- log ---"
+    tail -n 10 "$LOG" 2>/dev/null
+}
+
+cmd_logs() {
+    [ -f "$LOG" ] || die "no log yet at $LOG"
+    tail -n "${1:-40}" "$LOG"
+}
+
+cmd_uninstall() {
+    launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+        || launchctl unload -w "$AGENT" >/dev/null 2>&1
+
+    if /usr/bin/sudo -v 2>/dev/null; then
+        /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || warn "could not reset pmset"
+        /usr/bin/sudo rm -f "$SUDOERS"
+    else
+        warn "skipping root cleanup; run: sudo pmset -a disablesleep 0 && sudo rm -f $SUDOERS"
+    fi
+
+    rm -rf "$APP_DIR" "$AGENT" "$CFG" "$BIN" "$LOG"
+    rm -f /usr/local/bin/lidkill 2>/dev/null
+    ok "removed. Normal lid behaviour restored."
+}
+
+# ---------------------------------------------------------------- dispatch
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+    install)            cmd_install "$@" ;;
+    on|arm|enable)      cmd_on "$@" ;;
+    off|disarm|disable) cmd_off "$@" ;;
+    status|st)          cmd_status ;;
+    mode)               cmd_mode "$@" ;;
+    delay)              cmd_delay "$@" ;;
+    dryrun)             cmd_dryrun "$@" ;;
+    test)               cmd_test ;;
+    logs|log)           cmd_logs "$@" ;;
+    uninstall|remove)   cmd_uninstall ;;
+    ''|help|-h|--help)  usage ;;
+    *)                  usage; exit 1 ;;
+esac
