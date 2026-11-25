@@ -1,11 +1,16 @@
 #!/bin/bash
-# lidkill watcher - runs under launchd, polls the lid, and kills the machine.
+# lidkill watcher - handles lid events and runs the configured power command.
 # Do not run this by hand unless you mean it; use `lidkill test` for a dry run.
 
 set -u
 
 CFG="${LIDKILL_CONFIG:-$HOME/.config/lidkill/config}"
 LOG="${LIDKILL_LOG:-$HOME/Library/Logs/lidkill.log}"
+SCRIPT="${BASH_SOURCE[0]}"
+case "$SCRIPT" in
+    */*) MONITOR="${SCRIPT%/*}/lid-events" ;;
+    *)   MONITOR="./lid-events" ;;
+esac
 
 MODE=poweroff
 DELAY=1
@@ -20,35 +25,53 @@ read_cfg() {
         . "$CFG"
     fi
     [ -n "${LIDKILL_DRYRUN:-}" ] && DRYRUN="$LIDKILL_DRYRUN"
+    [ -n "${LIDKILL_FAKE_LID:-}" ] && DRYRUN=1
     case "$DELAY" in ''|*[!0-9]*) DELAY=1 ;; esac
+    DELAY=${DELAY#"${DELAY%%[!0]*}"}
+    DELAY=${DELAY:-0}
+    case "$DELAY" in [0-9]|[1-5][0-9]|60) ;; *) DELAY=1 ;; esac
 }
 
 log() {
     printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$*" >>"$LOG" 2>/dev/null
 }
 
-# open | closed | unknown
+# Sets state to open, closed, or unknown.
 lid_state() {
+    local line
+    state=unknown
     # Test hook: LIDKILL_FAKE_LID may be "open"/"closed" or a file holding one.
     if [ -n "${LIDKILL_FAKE_LID:-}" ]; then
+        line=$LIDKILL_FAKE_LID
         if [ -f "$LIDKILL_FAKE_LID" ]; then
-            head -n 1 "$LIDKILL_FAKE_LID"
-        else
-            printf '%s\n' "$LIDKILL_FAKE_LID"
+            IFS= read -r line <"$LIDKILL_FAKE_LID" || true
         fi
+        case "$line" in open|closed) state=$line ;; esac
         return
     fi
-    local raw
-    raw=$(/usr/sbin/ioreg -r -k AppleClamshellState -d 4 2>/dev/null \
-        | /usr/bin/awk -F' = ' '/"AppleClamshellState"/ {gsub(/[^A-Za-z0-9]/, "", $2); print $2; exit}')
-    case "$raw" in
-        Yes|1) echo closed ;;
-        No|0)  echo open ;;
-        *)     echo unknown ;;
-    esac
+
+    while IFS= read -r line; do
+        case "$line" in
+            *'"AppleClamshellState" = Yes'|*'"AppleClamshellState" = 1') state=closed; break ;;
+            *'"AppleClamshellState" = No'|*'"AppleClamshellState" = 0') state=open; break ;;
+        esac
+    done < <(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1 2>/dev/null)
+}
+
+poll_lid() {
+    local previous=
+    while :; do
+        lid_state
+        if [ "$state" != "$previous" ]; then
+            printf '%s\n' "$state" || return
+            previous=$state
+        fi
+        sleep 1
+    done
 }
 
 fire() {
+    local mode=$MODE state
     local -a cmd
     case "$MODE" in
         poweroff) cmd=(/sbin/shutdown -h now) ;;
@@ -69,43 +92,74 @@ fire() {
     log "exit status $rc"
     if [ "$rc" -ne 0 ]; then
         sleep 2
+        lid_state
+        read_cfg
+        if [ "$state" != closed ] || [ "$DRYRUN" = 1 ] || [ "$MODE" != "$mode" ]; then
+            log "retry cancelled: lid state or settings changed"
+            return
+        fi
         log "retry"
         /usr/bin/sudo -n "${cmd[@]}" >>"$LOG" 2>&1
         log "retry exit status $?"
     fi
 }
 
-read_cfg
-prev=$(lid_state)
-log "watcher start pid=$$ lid=$prev mode=$MODE delay=${DELAY}s dryrun=$DRYRUN"
-
-tick=0
-while :; do
-    sleep 1
-    tick=$((tick + 1))
-    # Re-read settings roughly every 30s so `lidkill mode ...` applies without a restart.
-    [ $((tick % 30)) -eq 0 ] && read_cfg
-
-    cur=$(lid_state)
-    if [ "$cur" = unknown ]; then
-        prev=$cur
-        continue
-    fi
-
-    if [ "$cur" = closed ] && [ "$prev" != closed ]; then
-        log "lid closed"
-        d=$DELAY
-        while [ "$d" -gt 0 ]; do
-            sleep 1
-            d=$((d - 1))
-        done
-        if [ "$(lid_state)" = closed ]; then
-            fire
-            prev=closed
+watch_lid() {
+    local previous current state deadline
+    IFS= read -r -t 5 previous <&3 || return
+    read_cfg
+    log "watcher start pid=$$ lid=$previous mode=$MODE delay=${DELAY}s dryrun=$DRYRUN source=$1"
+    while IFS= read -r current <&3; do
+        if [ "$previous" != open ] || [ "$current" != closed ]; then
+            previous=$current
             continue
         fi
-        log "lid reopened before delay elapsed - aborted"
-    fi
 
-    prev=$cur
-done
+        read_cfg
+        log "lid closed"
+        if [ "$DELAY" -gt 0 ]; then
+            deadline=$((SECONDS + DELAY))
+            if IFS= read -r -t "$DELAY" current <&3; then
+                log "lid no longer confirmed closed - aborted"
+                previous=$current
+                continue
+            fi
+            # macOS Bash returns 1 for both EOF and timeout.
+            [ "$SECONDS" -ge "$deadline" ] || return
+        fi
+        kill -0 "$monitor_pid" 2>/dev/null || return
+        lid_state
+        if [ "$state" = closed ]; then
+            read_cfg
+            fire
+        else
+            log "lid no longer confirmed closed - aborted"
+        fi
+        previous=closed
+    done
+}
+
+monitor_pid=
+stop_monitor() {
+    if [ -n "$monitor_pid" ]; then
+        kill "$monitor_pid" 2>/dev/null
+        wait "$monitor_pid" 2>/dev/null
+        monitor_pid=
+    fi
+}
+
+trap stop_monitor EXIT
+trap 'exit 0' HUP INT TERM
+
+if [ -x "$MONITOR" ] && [ -z "${LIDKILL_FAKE_LID:-}" ]; then
+    exec 3< <(exec "$MONITOR")
+    monitor_pid=$!
+    watch_lid iokit
+    stop_monitor
+    exec 3<&-
+    log "lid event monitor unavailable - falling back to polling"
+fi
+
+exec 3< <(poll_lid)
+monitor_pid=$!
+watch_lid poll
