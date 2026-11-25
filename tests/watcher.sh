@@ -71,4 +71,18 @@ config poweroff 000
 lid closed
 await_log "DRY RUN: would execute /sbin/shutdown -h now"
 [ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 2 ]
+
+lid open
+sleep 1.2
+config reboot 3
+lid closed
+for ((tries = 0; tries < 30; tries++)); do
+    [ -s "$tmp/pending" ] && break
+    sleep 0.1
+done
+[ -s "$tmp/pending" ]
+rm "$tmp/pending"
+await_log "pending action cancelled"
+[ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 2 ]
+
 echo "Watcher dry-run checks passed"
