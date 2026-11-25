@@ -19,7 +19,9 @@ BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/lidkill"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 CFG="$HOME/.config/lidkill/config"
+PENDING="${CFG%/*}/pending"
 LOG="$HOME/Library/Logs/lidkill.log"
+MENU_APP="$APP_DIR/Lidkill.app"
 SUDOERS="/etc/sudoers.d/lidkill"
 DOMAIN="gui/$(id -u)"
 
@@ -61,6 +63,8 @@ Usage: lidkill <command>
   delay <seconds>      how long the lid must stay shut before firing
   dryrun <on|off>      log what would happen without killing anything
   test [seconds]       watch the lid in dry-run mode (default: 20s)
+  menu                 open the macOS menu bar app
+  cancel               cancel a pending lid-close action
   logs [lines]         tail the watcher log (default: 40 lines)
   logs --follow        stream new watcher log entries
   uninstall            remove everything and restore normal sleep
@@ -128,7 +132,7 @@ need_sudo() {
 # ---------------------------------------------------------------- commands
 
 cmd_install() {
-    local assets helper
+    local assets helper menu_asset
     if [ -f "$SRC/watcher.sh" ] && [ -f "$SRC/com.lidkill.watcher.plist" ]; then
         assets="$SRC"
     elif [ -f "$APP_DIR/watcher.sh" ] && [ -f "$APP_DIR/com.lidkill.watcher.plist" ]; then
@@ -163,6 +167,24 @@ cmd_install() {
         fi
     fi
 
+    if [ -f "$assets/menu/build.sh" ]; then
+        mkdir -p "$APP_DIR/menu" || die "cannot create menu source directory"
+        for menu_asset in build.sh Info.plist MenuBar.swift Lidkill.png; do
+            if ! [ "$assets/menu/$menu_asset" -ef "$APP_DIR/menu/$menu_asset" ]; then
+                /usr/bin/install -m 0644 "$assets/menu/$menu_asset" "$APP_DIR/menu/$menu_asset" \
+                    || die "cannot store menu source: $menu_asset"
+            fi
+        done
+    fi
+    if [ -r "$APP_DIR/menu/build.sh" ] && /usr/bin/xcode-select -p >/dev/null 2>&1 \
+        && /usr/bin/xcrun --find swiftc >/dev/null 2>&1; then
+        if /bin/bash "$APP_DIR/menu/build.sh" "$MENU_APP"; then
+            ok "Menu bar app ready. Open it with: lidkill menu"
+        else
+            warn "could not build the menu bar app"
+        fi
+    fi
+
     [ "$assets/com.lidkill.watcher.plist" -ef "$APP_DIR/com.lidkill.watcher.plist" ] \
         || /usr/bin/install -m 0644 "$assets/com.lidkill.watcher.plist" \
                "$APP_DIR/com.lidkill.watcher.plist" \
@@ -174,6 +196,10 @@ cmd_install() {
                  "$APP_DIR/com.lidkill.watcher.plist" >"$AGENT" || die "cannot write LaunchAgent"
     chmod 0644 "$AGENT"
     /usr/bin/plutil -lint "$AGENT" >/dev/null || die "generated LaunchAgent is not valid"
+    if ! agent_loaded; then
+        launchctl disable "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+            || warn "could not disable automatic watcher launch at sign-in"
+    fi
 
     if [ ! -f "$CFG" ]; then
         cat >"$CFG" <<'EOF'
@@ -261,12 +287,15 @@ EOF
 cmd_off() {
     if agent_loaded; then
         launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 \
-            || launchctl unload -w "$AGENT" >/dev/null 2>&1
+            || launchctl unload -w "$AGENT" >/dev/null 2>&1 \
+            || die "could not unload the watcher"
         echo "watcher unloaded"
     else
         echo "watcher was not loaded"
     fi
 
+    launchctl disable "$DOMAIN/$LABEL" >/dev/null 2>&1 \
+        || warn "could not disable automatic watcher launch at sign-in"
     need_sudo "Restoring normal lid sleep needs your password."
     /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || die "pmset failed"
     ok "DISARMED. Lid close sleeps normally again."
@@ -359,7 +388,7 @@ cmd_test() {
     echo "Watching the lid in DRY-RUN mode for ${duration}s."
     echo "${D}Note: a lid close is only detectable while armed (sleep disabled).${N}"
     echo
-    LIDKILL_CONFIG="$CFG" LIDKILL_DRYRUN=1 LIDKILL_LOG="$LOG" \
+    LIDKILL_CONFIG="$CFG" LIDKILL_DRYRUN=1 LIDKILL_LOG="$LOG" LIDKILL_PREVIEW_ONLY=1 \
         /bin/bash "$APP_DIR/watcher.sh" &
     pid=$!
     sleep "$duration" &
@@ -371,6 +400,23 @@ cmd_test() {
     trap - INT TERM
     echo "--- log ---"
     tail -n 10 "$LOG" 2>/dev/null
+}
+
+cmd_menu() {
+    [ -d "$MENU_APP" ] || die "menu app missing - install from the repo with Xcode or the Command Line Tools"
+    exec /usr/bin/open "$MENU_APP"
+}
+
+cmd_cancel() {
+    /bin/rm "$PENDING" 2>/dev/null || die "no pending lid-close action to cancel"
+    ok "Pending action cancelled."
+}
+
+cmd_menu_status() {
+    local armed=0
+    load_cfg
+    agent_loaded && armed=1
+    printf '%s\n' "$armed" "$MODE" "$DELAY" "$DRYRUN"
 }
 
 cmd_logs() {
@@ -392,7 +438,7 @@ cmd_uninstall() {
         warn "skipping root cleanup; run: sudo pmset -a disablesleep 0 && sudo rm -f $SUDOERS"
     fi
 
-    rm -rf "$APP_DIR" "$AGENT" "$CFG" "$BIN" "$LOG"
+    rm -rf "$APP_DIR" "$AGENT" "$CFG" "$PENDING" "$BIN" "$LOG"
     rm -f /usr/local/bin/lidkill 2>/dev/null
     ok "removed. Normal lid behaviour restored."
 }
@@ -411,6 +457,9 @@ case "$cmd" in
     delay)              cmd_delay "$@" ;;
     dryrun)             cmd_dryrun "$@" ;;
     test)               cmd_test "$@" ;;
+    menu)               cmd_menu ;;
+    cancel)             cmd_cancel ;;
+    menu-status)        cmd_menu_status ;;
     logs|log)           cmd_logs "$@" ;;
     uninstall|remove)   cmd_uninstall ;;
     ''|help|-h|--help)  usage ;;

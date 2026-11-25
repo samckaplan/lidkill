@@ -6,6 +6,12 @@ set -u
 
 CFG="${LIDKILL_CONFIG:-$HOME/.config/lidkill/config}"
 LOG="${LIDKILL_LOG:-$HOME/Library/Logs/lidkill.log}"
+case "$CFG" in
+    */*) PENDING="${CFG%/*}/pending" ;;
+    *)   PENDING="./pending" ;;
+esac
+[ "${LIDKILL_PREVIEW_ONLY:-0}" = 1 ] && PENDING=
+countdown_live=0
 SCRIPT="${BASH_SOURCE[0]}"
 case "$SCRIPT" in
     */*) MONITOR="${SCRIPT%/*}/lid-events" ;;
@@ -34,6 +40,34 @@ read_cfg() {
 
 log() {
     printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$*" >>"$LOG" 2>/dev/null
+}
+
+start_countdown() {
+    [ -n "$PENDING" ] || return 0
+    local temp now
+    temp=$(/usr/bin/mktemp "${PENDING}.XXXXXX") || return 1
+    if now=$(/bin/date +%s) && printf '%s\n' "$((now + DELAY))" >"$temp" &&
+        /bin/mv -f "$temp" "$PENDING"; then
+        countdown_live=1
+        return 0
+    fi
+    /bin/rm -f "$temp"
+    return 1
+}
+
+clear_countdown() {
+    if [ "$countdown_live" = 1 ]; then
+        /bin/rm -f "$PENDING"
+        countdown_live=0
+    fi
+}
+
+claim_countdown() {
+    [ "$countdown_live" = 1 ] || return 0
+    countdown_live=0
+    # Cancel unlinks the same file. Rename wins only if the request still exists.
+    /bin/mv -f "$PENDING" "$PENDING.firing.$$" 2>/dev/null || return 1
+    /bin/rm -f "$PENDING.firing.$$"
 }
 
 # Sets state to open, closed, or unknown.
@@ -118,8 +152,14 @@ watch_lid() {
         read_cfg
         log "lid closed"
         if [ "$DELAY" -gt 0 ]; then
+            if ! start_countdown; then
+                log "could not publish countdown - aborted"
+                previous=closed
+                continue
+            fi
             deadline=$((SECONDS + DELAY))
             if IFS= read -r -t "$DELAY" current <&3; then
+                clear_countdown
                 log "lid no longer confirmed closed - aborted"
                 previous=$current
                 continue
@@ -131,8 +171,13 @@ watch_lid() {
         lid_state
         if [ "$state" = closed ]; then
             read_cfg
-            fire
+            if claim_countdown; then
+                fire
+            else
+                log "pending action cancelled"
+            fi
         else
+            clear_countdown
             log "lid no longer confirmed closed - aborted"
         fi
         previous=closed
@@ -141,6 +186,7 @@ watch_lid() {
 
 monitor_pid=
 stop_monitor() {
+    clear_countdown
     if [ -n "$monitor_pid" ]; then
         kill "$monitor_pid" 2>/dev/null
         wait "$monitor_pid" 2>/dev/null
@@ -150,6 +196,9 @@ stop_monitor() {
 
 trap stop_monitor EXIT
 trap 'exit 0' HUP INT TERM
+
+# launchd runs one watcher. Discard a countdown left by an unclean exit.
+[ -z "$PENDING" ] || /bin/rm -f "$PENDING"
 
 if [ -x "$MONITOR" ] && [ -z "${LIDKILL_FAKE_LID:-}" ]; then
     exec 3< <(exec "$MONITOR")

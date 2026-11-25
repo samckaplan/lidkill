@@ -16,6 +16,19 @@ your `PATH`, the installer prints the one line to add.
 On an armed installation, run `lidkill on` again after upgrading to restart
 the watcher.
 
+## Menu bar
+
+On macOS 12 or later, run `lidkill menu` after installing with Xcode or the
+Command Line Tools.
+Click the laptop power icon in the menu bar to arm or disarm, set the
+action and delay, toggle dry-run mode, or open the watcher log. Arming and
+disarming open Terminal for the existing administrator prompt.
+
+Choose **Preview Countdown** to try the icon countdown and Cancel without
+arming. An armed watcher shows its countdown for delays above zero.
+**Cancel Pending Action** skips that lid close. Open and close the lid
+again to start a new countdown.
+
 ## Commands
 
 | command | what it does |
@@ -31,6 +44,8 @@ the watcher.
 | `lidkill delay 3` | lid must stay shut N seconds before firing (0–60) |
 | `lidkill dryrun on` | log only, never kill — safe for testing |
 | `lidkill test [seconds]` | watch the lid in dry-run mode for 1–300 seconds (default 20) |
+| `lidkill menu` | open the macOS menu bar app |
+| `lidkill cancel` | cancel a pending lid-close action |
 | `lidkill logs [lines]` | show recent log entries (default 40) |
 | `lidkill logs --follow` | watch new log entries as they arrive |
 | `lidkill uninstall` | remove everything |
