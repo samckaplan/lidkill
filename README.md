@@ -20,7 +20,7 @@ the watcher.
 
 On macOS 12 or later, run `lidkill menu` after installing with Xcode or the
 Command Line Tools.
-Click the laptop power icon in the menu bar to arm or disarm, set the
+Click the Lidkill icon in the menu bar to arm or disarm, set the
 action and delay, toggle dry-run mode, or open the watcher log. Arming and
 disarming open Terminal for the existing administrator prompt.
 
