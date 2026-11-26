@@ -18,16 +18,41 @@ the watcher.
 
 ## Menu bar
 
-On macOS 12 or later, run `lidkill menu` after installing with Xcode or the
-Command Line Tools.
-Click the Lidkill icon in the menu bar to arm or disarm, set the
-action and delay, toggle dry-run mode, or open the watcher log. Arming and
-disarming open Terminal for the existing administrator prompt.
+On macOS 12 or later, install with Xcode or the Command Line Tools. Lidkill
+opens in the menu bar at every sign-in without a Dock icon or startup window.
+Use `lidkill menu` to open it again after quitting. If an older Lidkill menu
+app is running during an upgrade, quit it and run `lidkill menu`.
+
+Click the Lidkill icon to arm or disarm, set the action and delay, toggle dry
+run, or open the watcher log. Arming and disarming open Terminal for the
+administrator prompt.
 
 Choose **Preview Countdown** to try the icon countdown and Cancel without
 arming. An armed watcher shows its countdown for delays above zero.
 **Cancel Pending Action** skips that lid close. Open and close the lid
 again to start a new countdown.
+
+### Lid Page
+
+Choose **Lid Page → Set Website** and enter an HTTP or HTTPS URL. **Preview Website**
+opens the browser window safely before you arm Lidkill. The window has one
+tab, a read-only address bar, and navigation within the configured site.
+Additional tabs, pop-ups, off-site navigation, and downloads are blocked.
+Sites that send you to a different domain for sign-in may fail to load.
+
+Once armed, closing the lid starts a **25-second countdown** and opens the
+site. Reopening the lid keeps the countdown going. Choose **Cancel Lid Action**
+in the window or **Cancel Pending Action** in the menu to stop it. An active
+external display can show the window while the lid is physically shut.
+
+Lid Page defaults to **Hard Shutdown**, which powers off the Mac. Choose
+**Hard Restart** to boot back up after the countdown. **Lid Action** and
+**Delay** apply to the currently selected setup. **Disable Lid Page** returns
+to the standard lid settings. Use a delay above zero to show the website.
+
+Hard Restart applies to the lid action. After a manual shutdown, startup
+follows the Mac’s hardware and power settings. FileVault may require sign-in
+before Lidkill can appear in the menu bar.
 
 ## Commands
 
@@ -40,6 +65,7 @@ again to start a new countdown.
 | `lidkill mode poweroff` | clean power off (default) |
 | `lidkill mode reboot` | clean reboot |
 | `lidkill mode hard` | `halt -q` — ungraceful, cache still flushed |
+| `lidkill mode hard-restart` | `reboot -q` — ungraceful restart, cache still flushed |
 | `lidkill mode nuke` | `halt -nq` — no flush at all, closest to pulling power |
 | `lidkill delay 3` | lid must stay shut N seconds before firing (0–60) |
 | `lidkill dryrun on` | log only, never kill — safe for testing |
@@ -85,13 +111,13 @@ it could react. So arming does two things:
    without polling. If the helper is unavailable or exits, the watcher
    checks the IORegistry once a second.
 
-When the lid closes, the watcher waits `DELAY` seconds and verifies that the
-lid is still shut before running the command. Reopening the lid during the
-delay cancels the pending action as soon as the watcher sees the change.
-Mode and dry-run changes are read before the action. Delay changes apply
-on the next close. A passwordless sudo rule
-limited to exactly those four commands (`/etc/sudoers.d/lidkill`) lets it work
-with no prompt at lid-close time.
+In standard mode, the watcher waits for the selected delay and verifies that
+the lid is still shut before running the command. Reopening the lid during
+that delay cancels the action. Lid Page keeps counting after a reopen so you
+can interact with the page on the built-in display. Mode and dry-run changes
+are read before the action. Delay changes apply on the next close. A
+passwordless sudo rule limited to the listed power commands
+(`/etc/sudoers.d/lidkill`) lets it work with no prompt at lid-close time.
 
 Everything is per-user; nothing runs as root except the one-shot shutdown
 command itself.
@@ -102,7 +128,8 @@ command itself.
   replicate holding the power button, because that is handled below the OS.
   `halt -nq` is the closest: it stops the kernel without flushing the disk.
   Treat `poweroff`/`reboot` as the sane defaults.
-- **`nuke` can corrupt the filesystem and loses unsaved work.** So can `hard`.
+- **`nuke` can corrupt the filesystem and loses unsaved work.** Hard Shutdown
+  and Hard Restart can also lose unsaved work.
 - **While armed, the Mac never sleeps.** Closed in a bag it will keep running
   (and heating) until power-off. That is inherent to detecting the lid.
 - **FileVault** means the next boot asks for your password; that is normal.
