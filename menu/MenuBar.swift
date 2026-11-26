@@ -8,8 +8,12 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let log = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/lidkill.log")
     private let commandQueue = DispatchQueue(label: "com.lidkill.menubar.commands")
-    private let menu = NSMenu()
+    let menu = NSMenu()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private var showControlsWhenReady = false
+    private var controlsReady = false
+    private(set) var controlsWindow: NSWindow?
+    var hasVisibleStatusItem: Bool { statusItem.isVisible && statusItem.button != nil && statusItem.menu === menu }
     private var configSource: DispatchSourceFileSystemObject?
     private var timer: Timer?
     private var previewDeadline: TimeInterval?
@@ -58,6 +62,9 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
         statusItem.button?.setAccessibilityLabel("Lidkill")
         statusItem.button?.toolTip = "Lidkill"
+        statusItem.autosaveName = "Lidkill"
+        statusItem.behavior = []
+        statusItem.isVisible = true
         menu.autoenablesItems = false
         menu.delegate = self
         statusItem.menu = menu
@@ -107,6 +114,38 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeCountdown()
         reloadCountdown()
         refreshSettings()
+        if showControlsWhenReady { showControls() }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.contains(where: { $0.absoluteString == "lidkill://controls" }) else { return }
+        if headline == nil {
+            showControlsWhenReady = true
+        } else {
+            showControls()
+        }
+    }
+
+    private func showControls() {
+        if controlsWindow == nil {
+            let frame = NSRect(x: 0, y: 0, width: 260, height: 96)
+            let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "Lidkill Controls"
+            window.isReleasedWhenClosed = false
+            let button = NSButton(title: "Open Lidkill Menu ▾", target: self, action: #selector(openControlsMenu(_:)))
+            button.bezelStyle = .rounded
+            button.frame = NSRect(x: 30, y: 30, width: 200, height: 36)
+            window.contentView?.addSubview(button)
+            window.initialFirstResponder = button
+            window.center()
+            controlsWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        controlsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func openControlsMenu(_ button: NSButton) {
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -132,11 +171,16 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func run(_ arguments: [String], completion: @escaping (Int32, String) -> Void) {
         let executable = cli
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = FileManager.default.homeDirectoryForCurrentUser.path
+        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        let commandEnvironment = environment
         commandQueue.async {
             let process = Process()
             let output = Pipe()
             process.executableURL = executable
             process.arguments = arguments
+            process.environment = commandEnvironment
             process.standardOutput = output
             process.standardError = output
             do {
@@ -166,27 +210,27 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         run(["menu-status"]) { [weak self] status, message in
             guard let self else { return }
             let fields = message.split(separator: "\n")
-            let available = status == 0 && fields.count == 7
+            let available = status == 0 && fields.count >= 4 && ["0", "1"].contains(fields[0])
             self.arm.isEnabled = available
             self.dryRunItem.isEnabled = available
             self.modeItem.isEnabled = available
             self.delayItem.isEnabled = available
-            self.loginItem.isEnabled = available
-            self.skipItem.isEnabled = available
-            self.reopenItem.isEnabled = available && hasPage
+            self.loginItem.isEnabled = available && fields.count >= 5
+            self.skipItem.isEnabled = available && fields.count >= 6
+            self.reopenItem.isEnabled = available && fields.count >= 7 && hasPage
             guard available else {
                 self.headline.title = "Lidkill · CLI Unavailable"
                 return
             }
             self.armed = fields[0] == "1"
             self.dryRun = fields[3] == "1"
-            self.launchAtSignIn = fields[4] == "1"
+            self.launchAtSignIn = fields.dropFirst(4).first == "1"
             self.headline.title = self.armed ? "Lidkill · Armed" : "Lidkill · Disarmed"
             self.arm.title = self.armed ? "Disarm…" : "Arm…"
             self.dryRunItem.state = self.dryRun ? .on : .off
             self.loginItem.state = self.launchAtSignIn ? .on : .off
-            self.skipItem.state = fields[5] == "1" ? .on : .off
-            self.reopenItem.state = fields[6] == "1" ? .on : .off
+            self.skipItem.state = fields.dropFirst(5).first == "1" ? .on : .off
+            self.reopenItem.state = fields.dropFirst(6).first == "1" ? .on : .off
             let mode = String(fields[1])
             if let choices = self.modeItem.submenu?.items {
                 self.modeItem.title = "Lid Action · " +
@@ -200,6 +244,15 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.delayItem.title = delay == "0" ? "Delay · Immediate" : "Delay · \(delay)s"
             for choice in self.delayItem.submenu?.items ?? [] {
                 choice.state = choice.representedObject as? String == delay ? .on : .off
+            }
+            if !self.controlsReady && fields.count >= 7 && self.hasVisibleStatusItem {
+                let marker = self.configDirectory.appendingPathComponent("menu-ready")
+                do {
+                    try Data("\(getpid())\n".utf8).write(to: marker, options: .atomic)
+                    self.controlsReady = true
+                } catch {
+                    NSLog("Lidkill could not record menu readiness: %@", error.localizedDescription)
+                }
             }
         }
     }
@@ -451,21 +504,4 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !NSWorkspace.shared.open(log) { showMessage("The watcher has not created a log yet.") }
     }
 
-}
-
-@main
-enum LidkillApp {
-    @MainActor static func main() {
-        let application = NSApplication.shared
-        application.setActivationPolicy(.accessory)
-        if CommandLine.arguments.contains("--replace-menu"), let identifier = Bundle.main.bundleIdentifier {
-            for app in NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
-                where app.processIdentifier != getpid() && app.bundleURL == Bundle.main.bundleURL {
-                _ = app.terminate()
-            }
-        }
-        let menuBar = MenuBar()
-        application.delegate = menuBar
-        withExtendedLifetime(menuBar) { application.run() }
-    }
 }

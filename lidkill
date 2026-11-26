@@ -27,6 +27,7 @@ MENU_APP="$APP_DIR/Lidkill.app"
 MENU_LABEL="com.lidkill.menubar"
 MENU_AGENT="$HOME/Library/LaunchAgents/$MENU_LABEL.plist"
 MENU_LOG="$HOME/Library/Logs/lidkill-menu.log"
+MENU_READY="${CFG%/*}/menu-ready"
 SUDOERS="/etc/sudoers.d/lidkill"
 DOMAIN="gui/$(id -u)"
 
@@ -68,7 +69,7 @@ Usage: lidkill <command>
   delay <seconds>      how long the lid must stay shut before firing
   dryrun <on|off>      log what would happen without killing anything
   test [seconds]       watch the lid in dry-run mode (default: 20s)
-  menu                 open the macOS menu bar app
+  menu                 set up if needed and open the menu bar controls
   login <on|off>        start the menu bar app automatically at sign-in
   doctor               report menu app, sign-in agent, and watcher status
   cancel               cancel a pending lid-close action
@@ -149,7 +150,8 @@ need_sudo() {
 # ---------------------------------------------------------------- commands
 
 install_menu_agent() {
-    local template="$APP_DIR/menu/$MENU_LABEL.plist" temp
+    local template="$APP_DIR/menu/$MENU_LABEL.plist" temp fresh=0
+    [ -f "$MENU_AGENT" ] || fresh=1
     temp=$(/usr/bin/mktemp "${MENU_AGENT}.XXXXXX") || return 1
     if ! cp "$template" "$temp" ||
         ! /usr/bin/plutil -remove ProgramArguments.3 "$temp" ||
@@ -164,6 +166,7 @@ install_menu_agent() {
     if menu_agent_loaded; then
         launchctl bootout "$DOMAIN/$MENU_LABEL" || return 1
     fi
+    if [ "$fresh" = 1 ]; then launchctl enable "$DOMAIN/$MENU_LABEL" || return 1; fi
     if menu_login_enabled; then launchctl bootstrap "$DOMAIN" "$MENU_AGENT"; fi
 }
 
@@ -182,10 +185,17 @@ menu_login_enabled() {
 }
 
 menu_pid() {
-    /bin/ps -xww -o pid=,command= | /usr/bin/awk -v binary="$MENU_APP/Contents/MacOS/Lidkill" '
+    /bin/ps -xww -o pid=,command= | /usr/bin/awk -v wanted="${1:-}" -v binary="$MENU_APP/Contents/MacOS/Lidkill" '
         { pid=$1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "") }
-        $0 == binary || index($0, binary " ") == 1 { print pid; exit }
+        (wanted == "" || wanted == pid) && ($0 == binary || index($0, binary " ") == 1) { print pid; exit }
     '
+}
+
+menu_ready_pid() {
+    local ready
+    [ -f "$MENU_READY" ] && IFS= read -r ready <"$MENU_READY" || return 0
+    case "$ready" in ''|*[!0-9]*) return 0 ;; esac
+    menu_pid "$ready"
 }
 
 cmd_install() {
@@ -210,7 +220,7 @@ cmd_install() {
 
     [ ! -d "$MENU_APP" ] || updating=1
     mkdir -p "$APP_DIR/menu" || die "cannot create menu source directory"
-    for menu_asset in build.sh Info.plist MenuBar.swift LidPage.swift Lidkill.png "$MENU_LABEL.plist"; do
+    for menu_asset in build.sh Info.plist MenuApp.swift MenuBar.swift LidPage.swift Lidkill.png "$MENU_LABEL.plist"; do
         if ! [ "$assets/menu/$menu_asset" -ef "$APP_DIR/menu/$menu_asset" ]; then
             /usr/bin/install -m 0644 "$assets/menu/$menu_asset" "$APP_DIR/menu/$menu_asset" \
                 || die "cannot store menu source: $menu_asset"
@@ -245,6 +255,10 @@ cmd_install() {
                "$APP_DIR/com.lidkill.watcher.plist" \
         || die "cannot store the plist template"
 
+    if menu_session && ! agent_loaded; then
+        launchctl disable "$DOMAIN/$LABEL" || die "could not keep the watcher disarmed during setup"
+    fi
+
     local launch_agent
     launch_agent=$(/usr/bin/mktemp "${AGENT}.XXXXXX") || die "cannot stage watcher LaunchAgent"
     if ! cp "$APP_DIR/com.lidkill.watcher.plist" "$launch_agent" ||
@@ -257,11 +271,6 @@ cmd_install() {
         rm -f "$launch_agent"
         die "cannot write watcher LaunchAgent"
     fi
-    if menu_session && ! agent_loaded; then
-        launchctl disable "$DOMAIN/$LABEL" >/dev/null 2>&1 \
-            || warn "could not disable automatic watcher launch at sign-in"
-    fi
-
     if [ ! -f "$CFG" ]; then
         cat >"$CFG" <<'EOF'
 # lidkill settings
@@ -276,6 +285,7 @@ EOF
 
     [ "$SELF" -ef "$BIN" ] || /usr/bin/install -m 0755 "$SELF" "$BIN" || die "cannot install $BIN"
 
+    /bin/rm -f "$MENU_READY" || die "cannot reset menu startup status"
     install_menu_agent || warn "sign-in launch could not be enabled. Run: $BIN doctor"
     if menu_session; then
         if [ "$updating" = 1 ]; then
@@ -283,12 +293,12 @@ EOF
         else
             /usr/bin/open -g "$MENU_APP" || die "could not open menu bar app. Run: $BIN doctor"
         fi
-        for ((tries = 0; tries < 20; tries++)); do
-            pid=$(menu_pid)
+        for ((tries = 0; tries < 40; tries++)); do
+            pid=$(menu_ready_pid)
             [ -z "$pid" ] || break
             sleep 0.25
         done
-        [ -n "$pid" ] || die "menu bar app exited during launch. Run: $BIN doctor"
+        [ -n "$pid" ] || die "menu controls did not become ready. Run: $BIN doctor"
     else
         warn "No macOS desktop session. Run $BIN menu after signing in."
     fi
@@ -487,8 +497,15 @@ cmd_test() {
 }
 
 cmd_menu() {
-    [ -d "$MENU_APP" ] || die "menu app missing - install from the repo with Xcode or the Command Line Tools"
-    exec /usr/bin/open -g "$MENU_APP"
+    menu_session || die "sign in to the macOS desktop before opening the menu"
+    if [ ! -x "$MENU_APP/Contents/MacOS/Lidkill" ] || [ ! -x "$BIN" ] || [ ! -f "$MENU_AGENT" ] ||
+        { [ -f "$SRC/menu/MenuApp.swift" ] && ! /usr/bin/cmp -s "$SELF" "$BIN"; }; then
+        cmd_install
+    fi
+    if menu_login_enabled && ! menu_agent_loaded; then
+        (cmd_login on) || warn "could not restore launch at sign-in. Run: $BIN doctor"
+    fi
+    exec /usr/bin/open -a "$MENU_APP" 'lidkill://controls'
 }
 
 cmd_login() {
@@ -522,11 +539,16 @@ cmd_doctor() {
         pid=$(menu_pid)
         if [ -n "$pid" ]; then
             printf 'Menu bar: running (PID %s)\n' "$pid"
+            if [ -n "$(menu_ready_pid)" ]; then
+                echo "Menu controls: ready"
+            else
+                echo "Menu controls: waiting for the app to read its config"
+            fi
         else
             printf 'Menu bar: stopped. Open with %s menu\n' "$BIN"
         fi
     else
-        echo "Menu app: missing. Run ./lidkill install from the repo."
+        echo "Menu app: missing. Run ./lidkill menu from the repo."
     fi
     if [ ! -f "$MENU_AGENT" ]; then
         echo "Launch at sign-in: missing. Run ./lidkill install from the repo."
@@ -601,7 +623,7 @@ cmd_uninstall() {
         warn "skipping root cleanup; run: sudo pmset -a disablesleep 0 && sudo rm -f $SUDOERS"
     fi
 
-    rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG" "$PENDING" "$SKIP" "$PAGE_URL" "$BIN" "$LOG" "$MENU_LOG"
+    rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG" "$PENDING" "$SKIP" "$PAGE_URL" "$MENU_READY" "$BIN" "$LOG" "$MENU_LOG"
     rm -f /usr/local/bin/lidkill 2>/dev/null
     ok "removed. Normal lid behaviour restored."
 }
