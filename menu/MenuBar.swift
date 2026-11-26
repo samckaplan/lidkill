@@ -9,15 +9,20 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         .appendingPathComponent("Library/Logs/lidkill.log")
     private let commandQueue = DispatchQueue(label: "com.lidkill.menubar.commands")
     private let menu = NSMenu()
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private var configSource: DispatchSourceFileSystemObject?
     private var timer: Timer?
     private var previewDeadline: TimeInterval?
+    private var previewShowsPage = false
+    private var pendingDeadline: TimeInterval?
+    private var pendingShowsPage = false
     private var pageDeadline: TimeInterval?
     private var livePage: LidPage?
     private var websitePreview: LidPage?
     private var armed = false
     private var dryRun = false
+    private var launchAtSignIn = false
+    private var configuredDelay = 1
     private var headline: NSMenuItem!
     private var countdown: NSMenuItem!
     private var cancel: NSMenuItem!
@@ -25,7 +30,10 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dryRunItem: NSMenuItem!
     private var modeItem: NSMenuItem!
     private var delayItem: NSMenuItem!
+    private var loginItem: NSMenuItem!
+    private var pageItem: NSMenuItem!
     private var previewWebsite: NSMenuItem!
+    private var testWebsite: NSMenuItem!
     private var clearWebsite: NSMenuItem!
 
     private var pageURLFile: URL { configDirectory.appendingPathComponent("page-url") }
@@ -41,8 +49,11 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let icon = NSImage(cgImage: glyph, size: NSSize(width: 17, height: 17))
             icon.isTemplate = true
             statusItem.button?.image = icon
-            statusItem.button?.imagePosition = .imageLeading
         }
+        if statusItem.button?.image == nil {
+            statusItem.button?.image = NSImage(systemSymbolName: "power", accessibilityDescription: "Lidkill")
+        }
+        statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
         statusItem.button?.setAccessibilityLabel("Lidkill")
         statusItem.button?.toolTip = "Lidkill"
         menu.autoenablesItems = false
@@ -60,34 +71,42 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modeItem = add("Lid Action", to: menu)
         modeItem.submenu = choices(
             [("Power Off", "poweroff"), ("Restart", "reboot"),
-             ("Hard Shutdown", "hard"), ("Hard Restart", "hard-restart")], action: #selector(setMode(_:))
+             ("Hard Shutdown", "hard"), ("Hard Restart", "hard-restart"),
+             ("Emergency Shutdown", "nuke")], action: #selector(setMode(_:))
         )
         delayItem = add("Delay", to: menu)
         delayItem.submenu = choices(
             [0, 1, 3, 5, 10, 25, 30, 60].map { ($0 == 0 ? "Immediate" : "\($0)s", String($0)) },
             action: #selector(setDelay(_:))
         )
+        if let delays = delayItem.submenu {
+            _ = add("Custom…", to: delays, action: #selector(setCustomDelay))
+        }
         let pageMenu = NSMenu()
         pageMenu.autoenablesItems = false
-        add("Lid Page", to: menu).submenu = pageMenu
+        pageItem = add("Lid Page", to: menu)
+        pageItem.submenu = pageMenu
+        pageItem.isEnabled = true
         _ = add("Set Website…", to: pageMenu, action: #selector(setWebsite))
         previewWebsite = add("Preview Website", to: pageMenu, action: #selector(showWebsitePreview))
+        testWebsite = add("Test Countdown With Website", to: pageMenu, action: #selector(testWebsiteCountdown))
         clearWebsite = add("Disable Lid Page", to: pageMenu, action: #selector(disableWebsite))
         menu.addItem(.separator())
+        loginItem = add("Launch at Sign-In", to: menu, action: #selector(toggleLogin))
         _ = add("Preview Countdown", to: menu, action: #selector(preview))
+        _ = add("Setup Status…", to: menu, action: #selector(showSetupStatus))
         _ = add("Open Log", to: menu, action: #selector(openLog))
-        _ = add("Quit Until Next Sign-In", to: menu, action: #selector(quit))
-        for control in [arm, dryRunItem, modeItem, delayItem] {
+        for control in [arm, dryRunItem, modeItem, delayItem, loginItem] {
             control?.isEnabled = false
         }
 
         observeCountdown()
-        refreshCountdown()
+        reloadCountdown()
         refreshSettings()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        refreshCountdown()
+        reloadCountdown()
         refreshSettings()
     }
 
@@ -129,26 +148,37 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshSettings() {
-        let hasPage = configuredPageURL != nil
+        let page = configuredPageURL
+        let hasPage = page != nil
+        if let host = page?.host {
+            pageItem.title = "Lid Page · " + (host.count <= 28 ? host : String(host.prefix(27)) + "…")
+        } else {
+            pageItem.title = "Lid Page · Off"
+        }
+        pageItem.isEnabled = pageDeadline == nil
         previewWebsite.isEnabled = hasPage && pageDeadline == nil
+        testWebsite.isEnabled = hasPage && pageDeadline == nil
         clearWebsite.isEnabled = hasPage && pageDeadline == nil
         run(["menu-status"]) { [weak self] status, message in
             guard let self else { return }
             let fields = message.split(separator: "\n")
-            let available = status == 0 && fields.count == 4
+            let available = status == 0 && fields.count == 5
             self.arm.isEnabled = available
             self.dryRunItem.isEnabled = available
             self.modeItem.isEnabled = available
             self.delayItem.isEnabled = available
+            self.loginItem.isEnabled = available
             guard available else {
                 self.headline.title = "Lidkill · CLI Unavailable"
                 return
             }
             self.armed = fields[0] == "1"
             self.dryRun = fields[3] == "1"
+            self.launchAtSignIn = fields[4] == "1"
             self.headline.title = self.armed ? "Lidkill · Armed" : "Lidkill · Disarmed"
             self.arm.title = self.armed ? "Disarm…" : "Arm…"
             self.dryRunItem.state = self.dryRun ? .on : .off
+            self.loginItem.state = self.launchAtSignIn ? .on : .off
             let mode = String(fields[1])
             if let choices = self.modeItem.submenu?.items {
                 self.modeItem.title = "Lid Action · " +
@@ -158,6 +188,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             let delay = String(fields[2])
+            self.configuredDelay = Int(delay) ?? (hasPage ? 25 : 1)
             self.delayItem.title = delay == "0" ? "Delay · Immediate" : "Delay · \(delay)s"
             for choice in self.delayItem.submenu?.items ?? [] {
                 choice.state = choice.representedObject as? String == delay ? .on : .off
@@ -171,20 +202,30 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: descriptor, eventMask: .write, queue: .main
         )
-        source.setEventHandler { [weak self] in self?.refreshCountdown() }
+        source.setEventHandler { [weak self] in self?.reloadCountdown() }
         source.setCancelHandler { Darwin.close(descriptor) }
         source.resume()
         configSource = source
     }
 
-    private func refreshCountdown() {
-        let now = Date().timeIntervalSince1970
+    private func reloadCountdown() {
         let path = configDirectory.appendingPathComponent("pending")
         let pending = (try? String(contentsOf: path, encoding: .utf8))?.split(separator: "\n") ?? []
-        let live = pending.first.flatMap { TimeInterval($0) }
+        pendingDeadline = pending.first.flatMap { TimeInterval($0) }
+        pendingShowsPage = pending.last == "page"
+        refreshCountdown()
+    }
+
+    private func refreshCountdown() {
+        let now = Date().timeIntervalSince1970
+        let live = pendingDeadline
             .flatMap { (now - 2 ... now + 60).contains($0) ? $0 : nil }
-        refreshLidPage(pending.last == "page" ? live : nil, now: now)
-        if live != nil || (previewDeadline ?? .infinity) <= now { previewDeadline = nil }
+        if live != nil || (previewDeadline ?? .infinity) <= now {
+            previewDeadline = nil
+            previewShowsPage = false
+        }
+        let siteDeadline = pendingShowsPage ? live : nil
+        refreshLidPage(siteDeadline ?? (previewShowsPage ? previewDeadline : nil), now: now, simulation: live == nil)
         let deadline = live ?? previewDeadline
         countdown.isHidden = deadline == nil
         cancel.isHidden = deadline == nil
@@ -192,24 +233,30 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let deadline {
             let seconds = max(0, Int(ceil(deadline - now)))
-            statusItem.button?.title = "\(seconds)s"
+            statusItem.length = NSStatusItem.squareLength
+            statusItem.button?.imagePosition = .noImage
+            statusItem.button?.title = String(seconds)
             countdown.title = previewDeadline == nil ? "Lid Action in \(seconds)s" : "Preview · \(seconds)s"
             if timer == nil {
-                let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+                let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
                     self?.refreshCountdown()
                 }
+                timer.tolerance = 0.1
                 RunLoop.main.add(timer, forMode: .common)
                 RunLoop.main.add(timer, forMode: .eventTracking)
                 self.timer = timer
             }
         } else {
-            statusItem.button?.title = ""
+            let hasIcon = statusItem.button?.image != nil
+            statusItem.length = hasIcon ? NSStatusItem.squareLength : NSStatusItem.variableLength
+            statusItem.button?.imagePosition = hasIcon ? .imageOnly : .noImage
+            statusItem.button?.title = hasIcon ? "" : "Lidkill"
             timer?.invalidate()
             timer = nil
         }
     }
 
-    private func refreshLidPage(_ deadline: TimeInterval?, now: TimeInterval) {
+    private func refreshLidPage(_ deadline: TimeInterval?, now: TimeInterval, simulation: Bool) {
         if deadline != pageDeadline {
             pageDeadline = deadline
             livePage?.close()
@@ -218,7 +265,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let deadline else { return }
         let seconds = max(0, Int(ceil(deadline - now)))
         if livePage == nil, seconds > 0, let url = configuredPageURL,
-           let page = LidPage(url: url, cancel: { [weak self] in self?.update(["cancel"]) }) {
+           let page = LidPage(url: url, simulation: simulation, cancel: { [weak self] in self?.cancelCountdown() }) {
             websitePreview?.close()
             websitePreview = nil
             livePage = page
@@ -234,7 +281,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             if status != 0 { self.showMessage(message) }
             self.refreshSettings()
-            self.refreshCountdown()
+            self.reloadCountdown()
         }
     }
 
@@ -247,13 +294,24 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func preview() {
+        previewShowsPage = false
         previewDeadline = Date().timeIntervalSince1970 + 5
-        refreshCountdown()
+        reloadCountdown()
+    }
+
+    @objc private func testWebsiteCountdown() {
+        reloadCountdown()
+        let now = Date().timeIntervalSince1970
+        guard configuredPageURL != nil, (pendingDeadline ?? 0) <= now else { return }
+        previewShowsPage = true
+        previewDeadline = now + TimeInterval(max(1, configuredDelay))
+        reloadCountdown()
     }
 
     @objc private func cancelCountdown() {
         if previewDeadline != nil {
             previewDeadline = nil
+            previewShowsPage = false
             refreshCountdown()
         } else {
             update(["cancel"])
@@ -276,12 +334,48 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleDryRun() { update(["dryrun", dryRun ? "off" : "on"]) }
 
+    @objc private func toggleLogin() { update(["login", launchAtSignIn ? "off" : "on"]) }
+
+    @objc private func showSetupStatus() {
+        run(["doctor"]) { [weak self] _, report in self?.showMessage(report) }
+    }
+
     @objc private func setMode(_ sender: NSMenuItem) {
-        if let value = sender.representedObject as? String { update(["mode", value]) }
+        guard let value = sender.representedObject as? String else { return }
+        if value == "nuke" {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Enable emergency shutdown?"
+            alert.informativeText = "This immediately stops macOS without flushing the disk when the lid action fires. Unsaved work and filesystem data may be lost."
+            alert.addButton(withTitle: "Keep Current Action")
+            alert.addButton(withTitle: "Enable Emergency Shutdown")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        update(["mode", value])
     }
 
     @objc private func setDelay(_ sender: NSMenuItem) {
         if let value = sender.representedObject as? String { update(["delay", value]) }
+    }
+
+    @objc private func setCustomDelay() {
+        let alert = NSAlert()
+        alert.messageText = "Set Countdown Delay"
+        alert.informativeText = "Enter a whole number of seconds from 0 to 60."
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
+        input.stringValue = String(configuredDelay)
+        alert.accessoryView = input
+        alert.window.initialFirstResponder = input
+        alert.addButton(withTitle: "Save Delay")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let delay = Int(input.stringValue.trimmingCharacters(in: .whitespaces)), (0...60).contains(delay) else {
+            showMessage("Enter a whole number from 0 to 60.")
+            return
+        }
+        update(["delay", String(delay)])
     }
 
     @objc private func setWebsite() {
@@ -333,20 +427,21 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !NSWorkspace.shared.open(log) { showMessage("The watcher has not created a log yet.") }
     }
 
-    @objc private func quit() { NSApp.terminate(nil) }
 }
 
 @main
 enum LidkillApp {
     @MainActor static func main() {
-        if let identifier = Bundle.main.bundleIdentifier,
-           NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
-            .contains(where: { $0.processIdentifier != getpid() }) { return }
-
         let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        if CommandLine.arguments.contains("--replace-menu"), let identifier = Bundle.main.bundleIdentifier {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+                where app.processIdentifier != getpid() && app.bundleURL == Bundle.main.bundleURL {
+                _ = app.terminate()
+            }
+        }
         let menuBar = MenuBar()
         application.delegate = menuBar
-        application.setActivationPolicy(.accessory)
         withExtendedLifetime(menuBar) { application.run() }
     }
 }
