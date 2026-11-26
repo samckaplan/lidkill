@@ -40,6 +40,16 @@ await_log() {
     return 1
 }
 
+await_pending() {
+    local tries
+    for ((tries = 0; tries < 30; tries++)); do
+        [ -s "$tmp/pending" ] && return
+        sleep 0.1
+    done
+    echo "Missing pending countdown" >&2
+    return 1
+}
+
 lid closed
 config poweroff 3
 /bin/bash ./watcher.sh &
@@ -76,13 +86,44 @@ lid open
 sleep 1.2
 config reboot 3
 lid closed
-for ((tries = 0; tries < 30; tries++)); do
-    [ -s "$tmp/pending" ] && break
-    sleep 0.1
-done
-[ -s "$tmp/pending" ]
+await_pending
 rm "$tmp/pending"
 await_log "pending action cancelled"
 [ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 2 ]
+
+lid open
+sleep 1.2
+config hard-restart 1
+lid closed
+await_log "DRY RUN: would execute /sbin/reboot -q"
+[ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 3 ]
+
+kill "$pid"
+wait "$pid"
+pid=
+: >"$LIDKILL_LOG"
+lid open
+config reboot 1
+printf '%s\n' https://example.com/ >"$tmp/page-url"
+/bin/bash ./watcher.sh &
+pid=$!
+await_log "lid=open mode=hard delay=25s dryrun=1 source=poll"
+
+# Shorten the page countdown for the reopen and manual cancel checks.
+printf '\nPAGE_DELAY=3\n' >>"$LIDKILL_CONFIG"
+lid closed
+await_log "lid closed"
+await_pending
+[ "$(sed -n '2p' "$tmp/pending")" = page ]
+lid open
+await_log "DRY RUN: would execute /sbin/halt -q"
+
+lid closed
+await_log "lid closed" 2
+await_pending
+rm "$tmp/pending"
+lid open
+await_log "pending action cancelled"
+[ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 1 ]
 
 echo "Watcher dry-run checks passed"

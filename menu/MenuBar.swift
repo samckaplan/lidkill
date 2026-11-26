@@ -13,6 +13,9 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var configSource: DispatchSourceFileSystemObject?
     private var timer: Timer?
     private var previewDeadline: TimeInterval?
+    private var pageDeadline: TimeInterval?
+    private var livePage: LidPage?
+    private var websitePreview: LidPage?
     private var armed = false
     private var dryRun = false
     private var headline: NSMenuItem!
@@ -22,6 +25,13 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dryRunItem: NSMenuItem!
     private var modeItem: NSMenuItem!
     private var delayItem: NSMenuItem!
+    private var previewWebsite: NSMenuItem!
+    private var clearWebsite: NSMenuItem!
+
+    private var pageURLFile: URL { configDirectory.appendingPathComponent("page-url") }
+    private var configuredPageURL: URL? {
+        (try? String(contentsOf: pageURLFile, encoding: .utf8)).flatMap(LidPage.websiteURL)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let iconURL = Bundle.main.url(forResource: "Lidkill", withExtension: "png"),
@@ -49,17 +59,24 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dryRunItem = add("Dry Run", to: menu, action: #selector(toggleDryRun))
         modeItem = add("Lid Action", to: menu)
         modeItem.submenu = choices(
-            [("Power Off", "poweroff"), ("Restart", "reboot")], action: #selector(setMode(_:))
+            [("Power Off", "poweroff"), ("Restart", "reboot"),
+             ("Hard Shutdown", "hard"), ("Hard Restart", "hard-restart")], action: #selector(setMode(_:))
         )
         delayItem = add("Delay", to: menu)
         delayItem.submenu = choices(
-            [0, 1, 3, 5, 10, 30, 60].map { ($0 == 0 ? "Immediate" : "\($0)s", String($0)) },
+            [0, 1, 3, 5, 10, 25, 30, 60].map { ($0 == 0 ? "Immediate" : "\($0)s", String($0)) },
             action: #selector(setDelay(_:))
         )
+        let pageMenu = NSMenu()
+        pageMenu.autoenablesItems = false
+        add("Lid Page", to: menu).submenu = pageMenu
+        _ = add("Set Website…", to: pageMenu, action: #selector(setWebsite))
+        previewWebsite = add("Preview Website", to: pageMenu, action: #selector(showWebsitePreview))
+        clearWebsite = add("Disable Lid Page", to: pageMenu, action: #selector(disableWebsite))
         menu.addItem(.separator())
         _ = add("Preview Countdown", to: menu, action: #selector(preview))
         _ = add("Open Log", to: menu, action: #selector(openLog))
-        _ = add("Quit Menu Bar App", to: menu, action: #selector(quit))
+        _ = add("Quit Until Next Sign-In", to: menu, action: #selector(quit))
         for control in [arm, dryRunItem, modeItem, delayItem] {
             control?.isEnabled = false
         }
@@ -112,6 +129,9 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshSettings() {
+        let hasPage = configuredPageURL != nil
+        previewWebsite.isEnabled = hasPage && pageDeadline == nil
+        clearWebsite.isEnabled = hasPage && pageDeadline == nil
         run(["menu-status"]) { [weak self] status, message in
             guard let self else { return }
             let fields = message.split(separator: "\n")
@@ -160,9 +180,10 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshCountdown() {
         let now = Date().timeIntervalSince1970
         let path = configDirectory.appendingPathComponent("pending")
-        let live = (try? String(contentsOf: path, encoding: .utf8))
-            .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let pending = (try? String(contentsOf: path, encoding: .utf8))?.split(separator: "\n") ?? []
+        let live = pending.first.flatMap { TimeInterval($0) }
             .flatMap { (now - 2 ... now + 60).contains($0) ? $0 : nil }
+        refreshLidPage(pending.last == "page" ? live : nil, now: now)
         if live != nil || (previewDeadline ?? .infinity) <= now { previewDeadline = nil }
         let deadline = live ?? previewDeadline
         countdown.isHidden = deadline == nil
@@ -185,6 +206,26 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusItem.button?.title = ""
             timer?.invalidate()
             timer = nil
+        }
+    }
+
+    private func refreshLidPage(_ deadline: TimeInterval?, now: TimeInterval) {
+        if deadline != pageDeadline {
+            pageDeadline = deadline
+            livePage?.close()
+            livePage = nil
+        }
+        guard let deadline else { return }
+        let seconds = max(0, Int(ceil(deadline - now)))
+        if livePage == nil, seconds > 0, let url = configuredPageURL,
+           let page = LidPage(url: url, cancel: { [weak self] in self?.update(["cancel"]) }) {
+            websitePreview?.close()
+            websitePreview = nil
+            livePage = page
+            page.updateCountdown(seconds)
+            page.show()
+        } else {
+            livePage?.updateCountdown(seconds)
         }
     }
 
@@ -243,6 +284,51 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let value = sender.representedObject as? String { update(["delay", value]) }
     }
 
+    @objc private func setWebsite() {
+        guard pageDeadline == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Set Lid Page Website"
+        alert.informativeText = "The default is a hard shutdown after 25 seconds. Reopening the lid keeps the countdown going. You can change the action and delay from the menu."
+        let address = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        address.placeholderString = "https://"
+        address.stringValue = configuredPageURL?.absoluteString ?? ""
+        alert.accessoryView = address
+        alert.window.initialFirstResponder = address
+        alert.addButton(withTitle: "Save Website")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let url = LidPage.websiteURL(address.stringValue) else {
+            showMessage("Enter a valid HTTP or HTTPS URL.")
+            return
+        }
+        do {
+            try Data((url.absoluteString + "\n").utf8).write(to: pageURLFile, options: .atomic)
+            refreshSettings()
+        } catch {
+            showMessage(error.localizedDescription)
+        }
+    }
+
+    @objc private func showWebsitePreview() {
+        guard pageDeadline == nil, let url = configuredPageURL else { return }
+        websitePreview?.close()
+        websitePreview = LidPage(url: url)
+        websitePreview?.show()
+    }
+
+    @objc private func disableWebsite() {
+        guard pageDeadline == nil else { return }
+        do {
+            try FileManager.default.removeItem(at: pageURLFile)
+            websitePreview?.close()
+            websitePreview = nil
+            refreshSettings()
+        } catch {
+            showMessage(error.localizedDescription)
+        }
+    }
+
     @objc private func openLog() {
         if !NSWorkspace.shared.open(log) { showMessage("The watcher has not created a log yet.") }
     }
@@ -250,8 +336,17 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
-let application = NSApplication.shared
-let menuBar = MenuBar()
-application.delegate = menuBar
-application.setActivationPolicy(.accessory)
-application.run()
+@main
+enum LidkillApp {
+    @MainActor static func main() {
+        if let identifier = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+            .contains(where: { $0.processIdentifier != getpid() }) { return }
+
+        let application = NSApplication.shared
+        let menuBar = MenuBar()
+        application.delegate = menuBar
+        application.setActivationPolicy(.accessory)
+        withExtendedLifetime(menuBar) { application.run() }
+    }
+}

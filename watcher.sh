@@ -7,9 +7,11 @@ set -u
 CFG="${LIDKILL_CONFIG:-$HOME/.config/lidkill/config}"
 LOG="${LIDKILL_LOG:-$HOME/Library/Logs/lidkill.log}"
 case "$CFG" in
-    */*) PENDING="${CFG%/*}/pending" ;;
-    *)   PENDING="./pending" ;;
+    */*) CONFIG_DIR="${CFG%/*}" ;;
+    *)   CONFIG_DIR=. ;;
 esac
+PENDING="$CONFIG_DIR/pending"
+PAGE_URL="$CONFIG_DIR/page-url"
 [ "${LIDKILL_PREVIEW_ONLY:-0}" = 1 ] && PENDING=
 countdown_live=0
 SCRIPT="${BASH_SOURCE[0]}"
@@ -23,19 +25,29 @@ DELAY=1
 DRYRUN=0
 
 read_cfg() {
+    local default_delay=1
     MODE=poweroff
     DELAY=1
+    PAGE_MODE=hard
+    PAGE_DELAY=25
     DRYRUN=0
     if [ -r "$CFG" ]; then
         # shellcheck disable=SC1090
         . "$CFG"
     fi
+    PROFILE=${1:-standard}
+    if [ "$#" -eq 0 ] && [ -s "$PAGE_URL" ]; then PROFILE=page; fi
+    if [ "$PROFILE" = page ]; then
+        MODE=$PAGE_MODE
+        DELAY=$PAGE_DELAY
+        default_delay=25
+    fi
     [ -n "${LIDKILL_DRYRUN:-}" ] && DRYRUN="$LIDKILL_DRYRUN"
     [ -n "${LIDKILL_FAKE_LID:-}" ] && DRYRUN=1
-    case "$DELAY" in ''|*[!0-9]*) DELAY=1 ;; esac
+    case "$DELAY" in ''|*[!0-9]*) DELAY=$default_delay ;; esac
     DELAY=${DELAY#"${DELAY%%[!0]*}"}
     DELAY=${DELAY:-0}
-    case "$DELAY" in [0-9]|[1-5][0-9]|60) ;; *) DELAY=1 ;; esac
+    case "$DELAY" in [0-9]|[1-5][0-9]|60) ;; *) DELAY=$default_delay ;; esac
 }
 
 log() {
@@ -47,6 +59,7 @@ start_countdown() {
     local temp now
     temp=$(/usr/bin/mktemp "${PENDING}.XXXXXX") || return 1
     if now=$(/bin/date +%s) && printf '%s\n' "$((now + DELAY))" >"$temp" &&
+        { [ "$PROFILE" != page ] || printf '%s\n' page >>"$temp"; } &&
         /bin/mv -f "$temp" "$PENDING"; then
         countdown_live=1
         return 0
@@ -105,14 +118,15 @@ poll_lid() {
 }
 
 fire() {
-    local mode=$MODE state
+    local mode=$MODE profile=$PROFILE state
     local -a cmd
     case "$MODE" in
-        poweroff) cmd=(/sbin/shutdown -h now) ;;
-        reboot)   cmd=(/sbin/shutdown -r now) ;;
-        hard)     cmd=(/sbin/halt -q) ;;
-        nuke)     cmd=(/sbin/halt -nq) ;;
-        *) log "unknown MODE=$MODE - refusing to act"; return 1 ;;
+        poweroff)     cmd=(/sbin/shutdown -h now) ;;
+        reboot)       cmd=(/sbin/shutdown -r now) ;;
+        hard)         cmd=(/sbin/halt -q) ;;
+        hard-restart) cmd=(/sbin/reboot -q) ;;
+        nuke)         cmd=(/sbin/halt -nq) ;;
+        *)            log "unknown MODE=$MODE - refusing to act"; return 1 ;;
     esac
 
     if [ "$DRYRUN" = 1 ]; then
@@ -127,8 +141,8 @@ fire() {
     if [ "$rc" -ne 0 ]; then
         sleep 2
         lid_state
-        read_cfg
-        if [ "$state" != closed ] || [ "$DRYRUN" = 1 ] || [ "$MODE" != "$mode" ]; then
+        read_cfg "$profile"
+        if { [ "$profile" != page ] && [ "$state" != closed ]; } || [ "$DRYRUN" = 1 ] || [ "$MODE" != "$mode" ]; then
             log "retry cancelled: lid state or settings changed"
             return
         fi
@@ -139,7 +153,7 @@ fire() {
 }
 
 watch_lid() {
-    local previous current state deadline
+    local previous current state deadline remaining profile
     IFS= read -r -t 5 previous <&3 || return
     read_cfg
     log "watcher start pid=$$ lid=$previous mode=$MODE delay=${DELAY}s dryrun=$DRYRUN source=$1"
@@ -150,6 +164,7 @@ watch_lid() {
         fi
 
         read_cfg
+        profile=$PROFILE
         log "lid closed"
         if [ "$DELAY" -gt 0 ]; then
             if ! start_countdown; then
@@ -158,19 +173,29 @@ watch_lid() {
                 continue
             fi
             deadline=$((SECONDS + DELAY))
-            if IFS= read -r -t "$DELAY" current <&3; then
-                clear_countdown
-                log "lid no longer confirmed closed - aborted"
-                previous=$current
-                continue
-            fi
-            # macOS Bash returns 1 for both EOF and timeout.
-            [ "$SECONDS" -ge "$deadline" ] || return
+            while remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ]; do
+                if IFS= read -r -t "$remaining" current <&3; then
+                    previous=$current
+                    if [ "$profile" != page ]; then
+                        clear_countdown
+                        log "lid no longer confirmed closed - aborted"
+                        continue 2
+                    fi
+                    if [ "$countdown_live" = 1 ] && [ ! -e "$PENDING" ]; then
+                        clear_countdown
+                        log "pending action cancelled"
+                        continue 2
+                    fi
+                else
+                    # macOS Bash returns 1 for both EOF and timeout.
+                    [ "$SECONDS" -ge "$deadline" ] || return
+                fi
+            done
         fi
         kill -0 "$monitor_pid" 2>/dev/null || return
         lid_state
-        if [ "$state" = closed ]; then
-            read_cfg
+        if [ "$profile" = page ] || [ "$state" = closed ]; then
+            read_cfg "$profile"
             if claim_countdown; then
                 fire
             else
@@ -181,6 +206,7 @@ watch_lid() {
             log "lid no longer confirmed closed - aborted"
         fi
         previous=closed
+        [ "$profile" != page ] || previous=$state
     done
 }
 
