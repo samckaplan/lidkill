@@ -147,7 +147,9 @@ need_sudo() {
 install_menu_agent() {
     local template="$APP_DIR/menu/$MENU_LABEL.plist" temp
     temp=$(/usr/bin/mktemp "${MENU_AGENT}.XXXXXX") || return 1
-    if ! /usr/bin/plutil -replace ProgramArguments.3 -string "$MENU_APP" -o "$temp" "$template" ||
+    if ! cp "$template" "$temp" ||
+        ! /usr/bin/plutil -remove ProgramArguments.3 "$temp" ||
+        ! /usr/bin/plutil -insert ProgramArguments.3 -string "$MENU_APP" "$temp" ||
         ! /usr/bin/plutil -replace StandardErrorPath -string "$MENU_LOG" "$temp" ||
         ! chmod 0644 "$temp" || ! mv -f "$temp" "$MENU_AGENT"; then
         rm -f "$temp"
@@ -241,8 +243,9 @@ cmd_install() {
 
     local launch_agent
     launch_agent=$(/usr/bin/mktemp "${AGENT}.XXXXXX") || die "cannot stage watcher LaunchAgent"
-    if ! /usr/bin/plutil -replace ProgramArguments.1 -string "$APP_DIR/watcher.sh" \
-            -o "$launch_agent" "$APP_DIR/com.lidkill.watcher.plist" ||
+    if ! cp "$APP_DIR/com.lidkill.watcher.plist" "$launch_agent" ||
+        ! /usr/bin/plutil -remove ProgramArguments.1 "$launch_agent" ||
+        ! /usr/bin/plutil -insert ProgramArguments.1 -string "$APP_DIR/watcher.sh" "$launch_agent" ||
         ! /usr/bin/plutil -replace EnvironmentVariables.HOME -string "$HOME" "$launch_agent" ||
         ! /usr/bin/plutil -replace StandardOutPath -string "$LOG" "$launch_agent" ||
         ! /usr/bin/plutil -replace StandardErrorPath -string "$LOG" "$launch_agent" ||
