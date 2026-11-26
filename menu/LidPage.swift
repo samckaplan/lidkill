@@ -52,11 +52,13 @@ final class LidPage: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDeleg
     private let countdown = NSTextField(labelWithString: "")
     private let message = NSTextField(labelWithString: "")
     private let cancel: (() -> Void)?
+    private let simulation: Bool
 
-    init?(url: URL, cancel: (() -> Void)? = nil) {
+    init?(url: URL, simulation: Bool = false, cancel: (() -> Void)? = nil) {
         guard let origin = Origin(url), let screen = NSScreen.main else { return nil }
         self.origin = origin
         self.cancel = cancel
+        self.simulation = simulation
         let frame = screen.visibleFrame
         let size = cancel == nil ? NSSize(width: min(900, frame.width), height: min(640, frame.height)) : frame.size
         window = BrowserWindow(contentRect: NSRect(origin: .zero, size: size),
@@ -64,7 +66,7 @@ final class LidPage: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDeleg
                                backing: .buffered, defer: false, screen: screen)
         super.init()
 
-        window.title = cancel == nil ? "Lidkill Website Preview" : "Lidkill"
+        window.title = cancel == nil || simulation ? "Lidkill Website Preview" : "Lidkill"
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         window.delegate = self
@@ -109,7 +111,8 @@ final class LidPage: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDeleg
         if cancel != nil {
             countdown.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
             tabs.addArrangedSubview(countdown)
-            tabs.addArrangedSubview(NSButton(title: "Cancel Lid Action", target: self, action: #selector(cancelAction)))
+            let cancelTitle = simulation ? "End Preview" : "Cancel Lid Action"
+            tabs.addArrangedSubview(NSButton(title: cancelTitle, target: self, action: #selector(cancelAction)))
         }
 
         configure(back, symbol: "chevron.left", label: "Back", action: #selector(goBack))
@@ -189,7 +192,7 @@ final class LidPage: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDeleg
     func windowWillClose(_ notification: Notification) { webView.stopLoading() }
 
     func updateCountdown(_ seconds: Int) {
-        countdown.stringValue = "\(seconds)s remaining"
+        countdown.stringValue = simulation ? "Preview · \(seconds)s" : "\(seconds)s remaining"
     }
 
     @objc private func cancelAction() { cancel?() }

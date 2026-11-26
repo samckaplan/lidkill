@@ -1,31 +1,50 @@
 # lidkill
 
-Closing the lid powers the Mac off — or reboots it — instead of sleeping.
-Toggleable on/off with one command.
+Lidkill gives Mac laptops a configurable action when you close the lid.
+Install on an Apple silicon or Intel Mac running macOS 12 or later.
+
+## Install or update
+
+Open Terminal while signed in to the Mac desktop. Install Xcode or run
+`xcode-select --install` and finish the Apple installer if the tools are missing.
 
 ```bash
-cd ~/AgentWorkspace/documents/lidkill
-./lidkill install      # no sudo, just copies files into your home
-./lidkill on           # asks for your password once, then arms it
-./lidkill off          # disarm, back to normal lid sleep
-./lidkill status
+git clone https://github.com/samckaplan/lidkill.git
+cd lidkill
+./lidkill install
 ```
 
-After `install`, the command lives at `~/.local/bin/lidkill`. If that is not on
-your `PATH`, the installer prints the one line to add.
-On an armed installation, run `lidkill on` again after upgrading to restart
-the watcher.
+If you already cloned Lidkill, run `git pull --ff-only` and `./lidkill install`
+inside your existing clone. Setup needs no administrator password. Fresh
+installs start disarmed. Existing config is kept. If upgrading while armed,
+re-arm the watcher to pick up the update. Double-clicking `install.command`
+in Finder also runs setup.
+
+### Copy-paste prompt for an AI agent
+
+> Install or update Lidkill on this Mac from `https://github.com/samckaplan/lidkill`.
+> Use the existing clone if available. Otherwise clone the official repo.
+> Check for macOS 12+ and Apple Command Line Tools. If the tools are missing,
+> ask me to finish the Apple installation before retrying. Run `./lidkill install`
+> as my signed-in desktop user without sudo, then run `~/.local/bin/lidkill doctor`.
+> Verify the menu app is running and launch at sign-in is enabled. If the app is
+> stopped, run `~/.local/bin/lidkill menu` and check again. If macOS blocks the
+> sign-in job, report the Login Items setting I need to approve. Keep a fresh
+> install disarmed and preserve any existing settings. Do not close the lid,
+> change power settings, request my password, or reboot during setup. Point me
+> to **Lid Page → Set Website** for configuring the site from the menu bar.
 
 ## Menu bar
 
-On macOS 12 or later, install with Xcode or the Command Line Tools. Lidkill
-opens in the menu bar at every sign-in without a Dock icon or startup window.
-Use `lidkill menu` to open it again after quitting. If an older Lidkill menu
-app is running during an upgrade, quit it and run `lidkill menu`.
+Lidkill opens immediately after setup and silently at each sign-in by default.
+It stays in the background and the sign-in job relaunches it if it exits. The
+menu icon takes one slot and shows seconds during a countdown. Use **Launch at
+Sign-In** to control automatic launch and relaunch.
 
-Click the Lidkill icon to arm or disarm, set the action and delay, toggle dry
-run, or open the watcher log. Arming and disarming open Terminal for the
-administrator prompt.
+Click the icon to arm or disarm, select any lid action, set a preset or custom
+delay, toggle dry run, or open the watcher log. Arming and disarming open
+Terminal for the administrator prompt. **Setup Status** reports whether the
+app, sign-in job, and lid watcher are running.
 
 Choose **Preview Countdown** to try the icon countdown and Cancel without
 arming. An armed watcher shows its countdown for delays above zero.
@@ -39,6 +58,8 @@ opens the browser window safely before you arm Lidkill. The window has one
 tab, a read-only address bar, and navigation within the configured site.
 Additional tabs, pop-ups, off-site navigation, and downloads are blocked.
 Sites that send you to a different domain for sign-in may fail to load.
+**Test Countdown With Website** shows the real page, countdown, and cancel
+control without touching the watcher or macOS power settings.
 
 Once armed, closing the lid starts a **25-second countdown** and opens the
 site. Reopening the lid keeps the countdown going. Choose **Cancel Lid Action**
@@ -71,6 +92,8 @@ before Lidkill can appear in the menu bar.
 | `lidkill dryrun on` | log only, never kill — safe for testing |
 | `lidkill test [seconds]` | watch the lid in dry-run mode for 1–300 seconds (default 20) |
 | `lidkill menu` | open the macOS menu bar app |
+| `lidkill doctor` | report menu startup and watcher status |
+| `lidkill login on` / `lidkill login off` | control automatic launch and relaunch |
 | `lidkill cancel` | cancel a pending lid-close action |
 | `lidkill logs [lines]` | show recent log entries (default 40) |
 | `lidkill logs --follow` | watch new log entries as they arrive |
@@ -140,12 +163,14 @@ command itself.
 ## Troubleshooting
 
 ```bash
-lidkill status
-lidkill logs
-launchctl print gui/$(id -u)/com.lidkill.watcher
-pmset -g | grep SleepDisabled      # must be 1 while armed
+~/.local/bin/lidkill doctor
+~/.local/bin/lidkill status
 ```
 
+- **Menu icon missing** — run `~/.local/bin/lidkill menu`. Check the right side
+  of the menu bar and any menu bar manager you use. If sign-in launch is blocked,
+  check **System Settings → General → Login Items & Extensions** (macOS 13 or
+  later) and allow the Lidkill background item, then run `~/.local/bin/lidkill login on`.
 - **Arming with the lid closed** — `on` refuses unless you pass `--force`.
   After forcing, open the lid and close it again to trigger the watcher.
 - **Detector shows polling** — install with Xcode or the Command Line Tools
