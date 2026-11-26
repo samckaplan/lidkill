@@ -44,12 +44,15 @@ Sign-In** to control automatic launch and relaunch.
 Click the icon to arm or disarm, select any lid action, set a preset or custom
 delay, toggle dry run, or open the watcher log. Arming and disarming open
 Terminal for the administrator prompt. **Setup Status** reports whether the
-app, sign-in job, and lid watcher are running.
+app, sign-in job, and lid watcher are running. **Copy Report** copies those
+details for troubleshooting.
 
 Choose **Preview Countdown** to try the icon countdown and Cancel without
 arming. An armed watcher shows its countdown for delays above zero.
 **Cancel Pending Action** skips that lid close. Open and close the lid
 again to start a new countdown.
+Use **Skip Next Lid Close** to ignore one future close while keeping Lidkill
+armed. Click it again to clear the skip.
 
 ### Lid Page
 
@@ -62,7 +65,8 @@ Sites that send you to a different domain for sign-in may fail to load.
 control without touching the watcher or macOS power settings.
 
 Once armed, closing the lid starts a **25-second countdown** and opens the
-site. Reopening the lid keeps the countdown going. Choose **Cancel Lid Action**
+site. Reopening keeps the countdown going by default. Turn on **Lid Page →
+Cancel on Reopen** to stop the countdown when the lid reopens. Choose **Cancel Lid Action**
 in the window or **Cancel Pending Action** in the menu to stop it. An active
 external display can show the window while the lid is physically shut.
 
@@ -95,6 +99,8 @@ before Lidkill can appear in the menu bar.
 | `lidkill doctor` | report menu startup and watcher status |
 | `lidkill login on` / `lidkill login off` | control automatic launch and relaunch |
 | `lidkill cancel` | cancel a pending lid-close action |
+| `lidkill skip on` / `lidkill skip off` | schedule or clear a one-time skip |
+| `lidkill page-reopen on` / `lidkill page-reopen off` | toggle cancel on reopen for Lid Page |
 | `lidkill logs [lines]` | show recent log entries (default 40) |
 | `lidkill logs --follow` | watch new log entries as they arrive |
 | `lidkill uninstall` | remove everything |
@@ -136,7 +142,7 @@ it could react. So arming does two things:
 
 In standard mode, the watcher waits for the selected delay and verifies that
 the lid is still shut before running the command. Reopening the lid during
-that delay cancels the action. Lid Page keeps counting after a reopen so you
+that delay cancels the action. By default, Lid Page keeps counting after a reopen so you
 can interact with the page on the built-in display. Mode and dry-run changes
 are read before the action. Delay changes apply on the next close. A
 passwordless sudo rule limited to the listed power commands

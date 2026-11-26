@@ -20,6 +20,7 @@ BIN="$BIN_DIR/lidkill"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 CFG="$HOME/.config/lidkill/config"
 PENDING="${CFG%/*}/pending"
+SKIP="${CFG%/*}/skip-next"
 PAGE_URL="${CFG%/*}/page-url"
 LOG="$HOME/Library/Logs/lidkill.log"
 MENU_APP="$APP_DIR/Lidkill.app"
@@ -71,6 +72,8 @@ Usage: lidkill <command>
   login <on|off>        start the menu bar app automatically at sign-in
   doctor               report menu app, sign-in agent, and watcher status
   cancel               cancel a pending lid-close action
+  skip <on|off>        skip one future lid close without disarming
+  page-reopen <on|off> cancel the Lid Page countdown on reopen
   logs [lines]         tail the watcher log (default: 40 lines)
   logs --follow        stream new watcher log entries
   uninstall            remove everything and restore normal sleep
@@ -92,6 +95,7 @@ load_cfg() {
     DELAY=1
     PAGE_MODE=hard
     PAGE_DELAY=25
+    PAGE_CANCEL_ON_REOPEN=0
     DRYRUN=0
     if [ -r "$CFG" ]; then
         # shellcheck disable=SC1090
@@ -547,12 +551,31 @@ cmd_cancel() {
     ok "Pending action cancelled."
 }
 
+cmd_skip() {
+    is_installed || die "not installed yet - run: $SELF install"
+    case "${1:-}" in
+        on) /usr/bin/touch "$SKIP" || die "could not schedule a skip" ;;
+        off) /bin/rm -f "$SKIP" || die "could not clear the skip" ;;
+        *) die "usage: lidkill skip <on|off>" ;;
+    esac
+}
+
+cmd_page_reopen() {
+    case "${1:-}" in
+        on) set_cfg PAGE_CANCEL_ON_REOPEN 1 ;;
+        off) set_cfg PAGE_CANCEL_ON_REOPEN 0 ;;
+        *) die "usage: lidkill page-reopen <on|off>" ;;
+    esac
+}
+
 cmd_menu_status() {
-    local armed=0 at_login=0
+    local armed=0 at_login=0 skip_next=0 cancel_on_reopen=0
     load_cfg
     agent_loaded && armed=1
     menu_login_enabled && at_login=1
-    printf '%s\n' "$armed" "$MODE" "$DELAY" "$DRYRUN" "$at_login"
+    [ ! -f "$SKIP" ] || skip_next=1
+    [ "$PAGE_CANCEL_ON_REOPEN" != 1 ] || cancel_on_reopen=1
+    printf '%s\n' "$armed" "$MODE" "$DELAY" "$DRYRUN" "$at_login" "$skip_next" "$cancel_on_reopen"
 }
 
 cmd_logs() {
@@ -578,7 +601,7 @@ cmd_uninstall() {
         warn "skipping root cleanup; run: sudo pmset -a disablesleep 0 && sudo rm -f $SUDOERS"
     fi
 
-    rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG" "$PENDING" "$PAGE_URL" "$BIN" "$LOG" "$MENU_LOG"
+    rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG" "$PENDING" "$SKIP" "$PAGE_URL" "$BIN" "$LOG" "$MENU_LOG"
     rm -f /usr/local/bin/lidkill 2>/dev/null
     ok "removed. Normal lid behaviour restored."
 }
@@ -601,6 +624,8 @@ case "$cmd" in
     login)              cmd_login "$@" ;;
     doctor)             cmd_doctor ;;
     cancel)             cmd_cancel ;;
+    skip)               cmd_skip "$@" ;;
+    page-reopen)        cmd_page_reopen "$@" ;;
     menu-status)        cmd_menu_status ;;
     logs|log)           cmd_logs "$@" ;;
     uninstall|remove)   cmd_uninstall ;;

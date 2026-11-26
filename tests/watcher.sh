@@ -126,4 +126,19 @@ lid open
 await_log "pending action cancelled"
 [ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 1 ]
 
+touch "$tmp/skip-next"
+lid closed
+await_log "skipped one lid close"
+[ ! -e "$tmp/skip-next" ] && [ ! -e "$tmp/pending" ]
+lid open
+sleep 1.2
+
+printf 'PAGE_CANCEL_ON_REOPEN=1\n' >>"$LIDKILL_CONFIG"
+lid closed
+await_pending
+lid open
+await_log "lid no longer confirmed closed - aborted"
+[ ! -e "$tmp/pending" ]
+[ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 1 ]
+
 echo "Watcher dry-run checks passed"

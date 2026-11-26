@@ -11,6 +11,7 @@ case "$CFG" in
     *)   CONFIG_DIR=. ;;
 esac
 PENDING="$CONFIG_DIR/pending"
+SKIP="$CONFIG_DIR/skip-next"
 PAGE_URL="$CONFIG_DIR/page-url"
 [ "${LIDKILL_PREVIEW_ONLY:-0}" = 1 ] && PENDING=
 countdown_live=0
@@ -30,6 +31,7 @@ read_cfg() {
     DELAY=1
     PAGE_MODE=hard
     PAGE_DELAY=25
+    PAGE_CANCEL_ON_REOPEN=0
     DRYRUN=0
     if [ -r "$CFG" ]; then
         # shellcheck disable=SC1090
@@ -118,7 +120,7 @@ poll_lid() {
 }
 
 fire() {
-    local mode=$MODE profile=$PROFILE state
+    local mode=$MODE profile=$PROFILE cancel_on_reopen=$1 state
     local -a cmd
     case "$MODE" in
         poweroff)     cmd=(/sbin/shutdown -h now) ;;
@@ -142,7 +144,7 @@ fire() {
         sleep 2
         lid_state
         read_cfg "$profile"
-        if { [ "$profile" != page ] && [ "$state" != closed ]; } || [ "$DRYRUN" = 1 ] || [ "$MODE" != "$mode" ]; then
+        if { [ "$cancel_on_reopen" = 1 ] && [ "$state" != closed ]; } || [ "$DRYRUN" = 1 ] || [ "$MODE" != "$mode" ]; then
             log "retry cancelled: lid state or settings changed"
             return
         fi
@@ -153,7 +155,7 @@ fire() {
 }
 
 watch_lid() {
-    local previous current state deadline remaining profile
+    local previous current state deadline remaining profile cancel_on_reopen
     IFS= read -r -t 5 previous <&3 || return
     read_cfg
     log "watcher start pid=$$ lid=$previous mode=$MODE delay=${DELAY}s dryrun=$DRYRUN source=$1"
@@ -163,8 +165,15 @@ watch_lid() {
             continue
         fi
 
+        if [ -n "$PENDING" ] && [ -f "$SKIP" ] && /bin/rm "$SKIP" 2>/dev/null; then
+            log "skipped one lid close"
+            previous=closed
+            continue
+        fi
         read_cfg
         profile=$PROFILE
+        cancel_on_reopen=1
+        if [ "$profile" = page ] && [ "$PAGE_CANCEL_ON_REOPEN" != 1 ]; then cancel_on_reopen=0; fi
         log "lid closed"
         if [ "$DELAY" -gt 0 ]; then
             if ! start_countdown; then
@@ -176,7 +185,7 @@ watch_lid() {
             while remaining=$((deadline - SECONDS)); [ "$remaining" -gt 0 ]; do
                 if IFS= read -r -t "$remaining" current <&3; then
                     previous=$current
-                    if [ "$profile" != page ]; then
+                    if [ "$cancel_on_reopen" = 1 ]; then
                         clear_countdown
                         log "lid no longer confirmed closed - aborted"
                         continue 2
@@ -194,10 +203,10 @@ watch_lid() {
         fi
         kill -0 "$monitor_pid" 2>/dev/null || return
         lid_state
-        if [ "$profile" = page ] || [ "$state" = closed ]; then
+        if [ "$cancel_on_reopen" = 0 ] || [ "$state" = closed ]; then
             read_cfg "$profile"
             if claim_countdown; then
-                fire
+                fire "$cancel_on_reopen"
             else
                 log "pending action cancelled"
             fi
