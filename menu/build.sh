@@ -20,7 +20,7 @@ done
 /usr/bin/xcrun --sdk macosx swiftc -swift-version 5 -O \
     -target "$(/usr/bin/uname -m)-apple-macos12.0" \
     -module-cache-path "$stage/module-cache" \
-    "$src/MenuBar.swift" "$src/LidPage.swift" -o "$contents/MacOS/Lidkill"
+    "$src/MenuApp.swift" "$src/MenuBar.swift" "$src/LidPage.swift" -o "$contents/MacOS/Lidkill"
 /usr/bin/codesign --sign - "$stage/Lidkill.app"
 
 if [ -e "$output" ]; then mv "$output" "$stage/previous.app"; fi

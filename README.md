@@ -11,7 +11,7 @@ Open Terminal while signed in to the Mac desktop. Install Xcode or run
 ```bash
 git clone https://github.com/samckaplan/lidkill.git
 cd lidkill
-./lidkill install
+./lidkill menu
 ```
 
 If you already cloned Lidkill, run `git pull --ff-only` and `./lidkill install`
@@ -40,6 +40,9 @@ Lidkill opens immediately after setup and silently at each sign-in by default.
 It stays in the background and the sign-in job relaunches it if it exits. The
 menu icon takes one slot and shows seconds during a countdown. Use **Launch at
 Sign-In** to control automatic launch and relaunch.
+
+`./lidkill menu` installs or repairs the menu from the checkout if needed and
+opens **Lidkill Controls**. Its button opens the same menu as the top-bar icon.
 
 Click the icon to arm or disarm, select any lid action, set a preset or custom
 delay, toggle dry run, or open the watcher log. Arming and disarming open
