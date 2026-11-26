@@ -31,6 +31,8 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var modeItem: NSMenuItem!
     private var delayItem: NSMenuItem!
     private var loginItem: NSMenuItem!
+    private var skipItem: NSMenuItem!
+    private var reopenItem: NSMenuItem!
     private var pageItem: NSMenuItem!
     private var previewWebsite: NSMenuItem!
     private var testWebsite: NSMenuItem!
@@ -67,6 +69,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cancel = add("Cancel Pending Action", to: menu, action: #selector(cancelCountdown))
         menu.addItem(.separator())
         arm = add("Arm…", to: menu, action: #selector(toggleArmed))
+        skipItem = add("Skip Next Lid Close", to: menu, action: #selector(toggleSkip))
         dryRunItem = add("Dry Run", to: menu, action: #selector(toggleDryRun))
         modeItem = add("Lid Action", to: menu)
         modeItem.submenu = choices(
@@ -88,6 +91,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pageItem.submenu = pageMenu
         pageItem.isEnabled = true
         _ = add("Set Website…", to: pageMenu, action: #selector(setWebsite))
+        reopenItem = add("Cancel on Reopen", to: pageMenu, action: #selector(toggleReopen))
         previewWebsite = add("Preview Website", to: pageMenu, action: #selector(showWebsitePreview))
         testWebsite = add("Test Countdown With Website", to: pageMenu, action: #selector(testWebsiteCountdown))
         clearWebsite = add("Disable Lid Page", to: pageMenu, action: #selector(disableWebsite))
@@ -96,7 +100,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = add("Preview Countdown", to: menu, action: #selector(preview))
         _ = add("Setup Status…", to: menu, action: #selector(showSetupStatus))
         _ = add("Open Log", to: menu, action: #selector(openLog))
-        for control in [arm, dryRunItem, modeItem, delayItem, loginItem] {
+        for control in [arm, dryRunItem, modeItem, delayItem, loginItem, skipItem, reopenItem] {
             control?.isEnabled = false
         }
 
@@ -162,12 +166,14 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         run(["menu-status"]) { [weak self] status, message in
             guard let self else { return }
             let fields = message.split(separator: "\n")
-            let available = status == 0 && fields.count == 5
+            let available = status == 0 && fields.count == 7
             self.arm.isEnabled = available
             self.dryRunItem.isEnabled = available
             self.modeItem.isEnabled = available
             self.delayItem.isEnabled = available
             self.loginItem.isEnabled = available
+            self.skipItem.isEnabled = available
+            self.reopenItem.isEnabled = available && hasPage
             guard available else {
                 self.headline.title = "Lidkill · CLI Unavailable"
                 return
@@ -179,6 +185,8 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.arm.title = self.armed ? "Disarm…" : "Arm…"
             self.dryRunItem.state = self.dryRun ? .on : .off
             self.loginItem.state = self.launchAtSignIn ? .on : .off
+            self.skipItem.state = fields[5] == "1" ? .on : .off
+            self.reopenItem.state = fields[6] == "1" ? .on : .off
             let mode = String(fields[1])
             if let choices = self.modeItem.submenu?.items {
                 self.modeItem.title = "Lid Action · " +
@@ -336,8 +344,24 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleLogin() { update(["login", launchAtSignIn ? "off" : "on"]) }
 
+    @objc private func toggleSkip() { update(["skip", skipItem.state == .on ? "off" : "on"]) }
+
+    @objc private func toggleReopen() { update(["page-reopen", reopenItem.state == .on ? "off" : "on"]) }
+
     @objc private func showSetupStatus() {
-        run(["doctor"]) { [weak self] _, report in self?.showMessage(report) }
+        run(["doctor"]) { [weak self] status, report in
+            guard status == 0 else { self?.showMessage(report); return }
+            let alert = NSAlert()
+            alert.messageText = "Lidkill Setup Status"
+            alert.informativeText = report.trimmingCharacters(in: .whitespacesAndNewlines)
+            alert.addButton(withTitle: "Done")
+            alert.addButton(withTitle: "Copy Report")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertSecondButtonReturn {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(report, forType: .string)
+            }
+        }
     }
 
     @objc private func setMode(_ sender: NSMenuItem) {
@@ -382,7 +406,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard pageDeadline == nil else { return }
         let alert = NSAlert()
         alert.messageText = "Set Lid Page Website"
-        alert.informativeText = "The default is a hard shutdown after 25 seconds. Reopening the lid keeps the countdown going. You can change the action and delay from the menu."
+        alert.informativeText = "The default is a hard shutdown after 25 seconds. You can change the action, delay, and reopen behavior from the menu."
         let address = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         address.placeholderString = "https://"
         address.stringValue = configuredPageURL?.absoluteString ?? ""
