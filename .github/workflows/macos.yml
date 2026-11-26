@@ -1,0 +1,26 @@
+name: macOS
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install and verify menu startup
+        run: bash tests/setup.sh
+      - name: Exercise watcher with simulated lid events
+        run: bash tests/watcher.sh
