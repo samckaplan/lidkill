@@ -11,10 +11,11 @@ mkdir -p "$contents/MacOS" "$contents/Resources"
 cp -X "$src/Info.plist" "$contents/Info.plist"
 cp -X "$src/Lidkill.png" "$contents/Resources/Lidkill.png"
 
-for action in on off; do
-    printf '#!/bin/bash\nexec "$HOME/.local/bin/lidkill" %s\n' "$action" \
-        >"$contents/Resources/$action.command"
-    chmod 0755 "$contents/Resources/$action.command"
+# Terminal scripts for the password prompts: arm, arm for a while, disarm.
+for entry in "on:on" "off:off" "on-1h:on --for 1h" "on-4h:on --for 4h" "on-8h:on --for 8h"; do
+    printf '#!/bin/bash\nexec "$HOME/.local/bin/lidkill" %s\n' "${entry#*:}" \
+        >"$contents/Resources/${entry%%:*}.command"
+    chmod 0755 "$contents/Resources/${entry%%:*}.command"
 done
 
 /usr/bin/xcrun --sdk macosx swiftc -swift-version 5 -O \

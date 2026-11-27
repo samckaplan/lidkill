@@ -2,32 +2,37 @@
 # lidkill - make closing the lid power the machine off (or reboot it).
 #
 #   lidkill install            copy the pieces into place (no sudo)
-#   lidkill on                 arm it (asks for your password once)
+#   lidkill on [--for 2h]      arm it (asks for your password once)
 #   lidkill off                disarm it
-#   lidkill status             show what is going on
-#   lidkill mode hard          poweroff | reboot | hard | hard-restart | nuke
-#   lidkill test [seconds]     timed dry run
+#   lidkill setup              guided configuration
+#   lidkill doctor [--fix]     diagnose (and repair) the install
+#   lidkill report             collect a shareable diagnostic report
 #   lidkill uninstall          remove everything
 #
-# Requires: macOS on Apple Silicon (or Intel), bash, ioreg, pmset.
+# Requires: macOS 12+ on Apple Silicon or Intel, bash, ioreg, pmset.
 
 set -uo pipefail
 
+VERSION=0.3.0
 LABEL="com.lidkill.watcher"
 APP_DIR="$HOME/Library/Application Support/lidkill"
 BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/lidkill"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 CFG="$HOME/.config/lidkill/config"
-PENDING="${CFG%/*}/pending"
-SKIP="${CFG%/*}/skip-next"
-PAGE_URL="${CFG%/*}/page-url"
+CFG_DIR="${CFG%/*}"
+PENDING="$CFG_DIR/pending"
+SKIP="$CFG_DIR/skip-next"
+PAGE_URL="$CFG_DIR/page-url"
+ARM_UNTIL="$CFG_DIR/arm-until"
+SOURCE_FILE="$CFG_DIR/source"
 LOG="$HOME/Library/Logs/lidkill.log"
 MENU_APP="$APP_DIR/Lidkill.app"
 MENU_LABEL="com.lidkill.menubar"
 MENU_AGENT="$HOME/Library/LaunchAgents/$MENU_LABEL.plist"
 MENU_LOG="$HOME/Library/Logs/lidkill-menu.log"
-MENU_READY="${CFG%/*}/menu-ready"
+MENU_READY="$CFG_DIR/menu-ready"
+MENU_STATE="$CFG_DIR/menu-state"
 SUDOERS="/etc/sudoers.d/lidkill"
 DOMAIN="gui/$(id -u)"
 
@@ -57,26 +62,43 @@ ok()   { printf '%s%s%s\n' "$G" "$*" "$N"; }
 
 usage() {
     cat <<EOF
-${B}lidkill${N} - closing the lid powers the machine off.
+${B}lidkill${N} $VERSION - closing the lid powers the machine off.
 
 Usage: lidkill <command>
 
-  install              install or update Lidkill and open its menu bar app (no sudo)
-  on [--force]         arm: keep awake with the lid shut, start the watcher
+Set up
+  install [--force]    install or update Lidkill and open its menu bar app (no sudo)
+  setup                answer a few questions to configure everything
+  preset <name>        one-step setups: safe | desk | guard | battery
+  config               show every setting (set one with: lidkill set <name> <value>)
+  update               pull the latest version of your clone and reinstall
+
+Use
+  on [--for 2h]        arm: keep awake with the lid shut, start the watcher
+                       (--for disarms by itself after 30m, 2h, 1d ... up to 7d)
   off                  disarm: unload the watcher, restore normal lid sleep
   status               show lid, mode, watcher and sleep state
-  mode <m>             poweroff (default) | reboot | hard | hard-restart | nuke
-  delay <seconds>      how long the lid must stay shut before firing
-  dryrun <on|off>      log what would happen without killing anything
   test [seconds]       watch the lid in dry-run mode (default: 20s)
-  menu                 set up if needed and open the menu bar controls
-  login <on|off>        start the menu bar app automatically at sign-in
-  doctor               report menu app, sign-in agent, and watcher status
   cancel               cancel a pending lid-close action
   skip <on|off>        skip one future lid close without disarming
+  logs [lines]         tail the watcher log (default: 40 lines); logs --follow streams
+
+Settings (also: lidkill set <name> <value>)
+  mode <m>             poweroff (default) | reboot | hard | hard-restart | nuke
+  delay <seconds>      how long the lid must stay shut before firing (0-60)
+  dryrun <on|off>      log what would happen without killing anything
+  when <any|battery|ac>  only act on this power source
+  external <on|off>    ignore lid close while an external display is connected
+  notify <on|off>      notification and sound when a countdown starts
+  hook <path|off>      run a script just before the action
   page-reopen <on|off> cancel the Lid Page countdown on reopen
-  logs [lines]         tail the watcher log (default: 40 lines)
-  logs --follow        stream new watcher log entries
+  login <on|off>       start the menu bar app automatically at sign-in
+
+Troubleshooting
+  menu                 set up if needed and open the menu bar controls
+  doctor [--fix]       report menu app, icon, sign-in agent and watcher; --fix repairs
+  report               write a redacted diagnostic report and copy it to the clipboard
+  version              print the version
   uninstall            remove everything and restore normal sleep
 
 Modes:
@@ -98,25 +120,30 @@ load_cfg() {
     PAGE_DELAY=25
     PAGE_CANCEL_ON_REOPEN=0
     DRYRUN=0
+    WHEN_POWER=any
+    IGNORE_EXTERNAL=0
+    NOTIFY=0
+    HOOK=
+    HOOK_TIMEOUT=5
     if [ -r "$CFG" ]; then
         # shellcheck disable=SC1090
         . "$CFG"
     fi
+    case "$WHEN_POWER" in any|battery|ac) ;; *) WHEN_POWER=any ;; esac
     if [ -s "$PAGE_URL" ]; then
         MODE=$PAGE_MODE
         DELAY=$PAGE_DELAY
     fi
 }
 
+# Rewrites one KEY=value line (value shell-quoted) without touching anything else.
 set_cfg() {
-    local key="$1" val="$2"
-    mkdir -p "$(dirname "$CFG")" || die "cannot create $(dirname "$CFG")"
+    local key="$1" val="$2" tmp
+    mkdir -p "$CFG_DIR" || die "cannot create $CFG_DIR"
     [ -f "$CFG" ] || : >"$CFG"
-    if grep -q "^${key}=" "$CFG" 2>/dev/null; then
-        /usr/bin/sed -i '' "s|^${key}=.*|${key}=${val}|" "$CFG" || die "cannot update $CFG"
-    else
-        printf '%s=%s\n' "$key" "$val" >>"$CFG" || die "cannot update $CFG"
-    fi
+    tmp=$(/usr/bin/mktemp "$CFG.XXXXXX") || die "cannot update $CFG"
+    { /usr/bin/grep -v "^${key}=" "$CFG"; printf '%s=%q\n' "$key" "$val"; } >"$tmp" \
+        && /bin/mv -f "$tmp" "$CFG" || { rm -f "$tmp"; die "cannot update $CFG"; }
 }
 
 lid_state() {
@@ -130,8 +157,16 @@ lid_state() {
     esac
 }
 
+power_source() {
+    case "$(/usr/bin/pmset -g batt 2>/dev/null | /usr/bin/head -n 1)" in
+        *"AC Power"*)      echo ac ;;
+        *"Battery Power"*) echo battery ;;
+        *)                 echo unknown ;;
+    esac
+}
+
 sleep_disabled() {
-    /usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/ {print $2; exit}'
+    /usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/ {print $2; found=1; exit} END {if (!found) print 0}'
 }
 
 agent_loaded() {
@@ -147,7 +182,48 @@ need_sudo() {
     /usr/bin/sudo -v || die "sudo was cancelled or failed"
 }
 
-# ---------------------------------------------------------------- commands
+# Normal lid sleep back on. $1=0 never asks for a password.
+restore_sleep() {
+    /usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 && return 0
+    [ "${1:-1}" = 1 ] || return 1
+    need_sudo "Restoring normal lid sleep needs your password."
+    /usr/bin/sudo /usr/bin/pmset -a disablesleep 0
+}
+
+# "90s", "30m", "2h", "1d" (a bare number means minutes) -> seconds.
+parse_duration() {
+    local n=$1 unit=m
+    case "$1" in *[smhd]) unit=${1: -1}; n=${1%?} ;; esac
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    case "$unit" in
+        s) n=$n ;; m) n=$((n * 60)) ;; h) n=$((n * 3600)) ;; d) n=$((n * 86400)) ;;
+    esac
+    [ "$n" -ge 60 ] && [ "$n" -le 604800 ] || return 1
+    echo "$n"
+}
+
+fmt_duration() {
+    local s=$1
+    if [ "$s" -ge 86400 ]; then printf '%sd %sh' $((s / 86400)) $((s % 86400 / 3600))
+    elif [ "$s" -ge 3600 ]; then printf '%sh %sm' $((s / 3600)) $((s % 3600 / 60))
+    elif [ "$s" -ge 60 ]; then printf '%sm' $((s / 60))
+    else printf '%ss' "$s"; fi
+}
+
+# Seconds left on the arm timer, 0 when none.
+arm_timer_left() {
+    local until now left=0
+    if [ -s "$ARM_UNTIL" ] && IFS= read -r until <"$ARM_UNTIL"; then
+        case "$until" in ''|*[!0-9]*) ;; *)
+            now=$(/bin/date +%s); left=$((until - now)); [ "$left" -gt 0 ] || left=0 ;;
+        esac
+    fi
+    echo "$left"
+}
+
+onoff() { [ "${1:-0}" = 1 ] && echo on || echo off; }
+
+# ------------------------------------------------------- menu app plumbing
 
 install_menu_agent() {
     local template="$APP_DIR/menu/$MENU_LABEL.plist" temp fresh=0
@@ -198,8 +274,61 @@ menu_ready_pid() {
     menu_pid "$ready"
 }
 
+# Lidkill menu apps running from anywhere except our own copy.
+stray_pids() {
+    /bin/ps -xww -o pid=,command= | /usr/bin/awk -v mine="$MENU_APP/Contents/MacOS/Lidkill" '
+        { pid=$1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "") }
+        index($0, "/usr/bin/awk ") != 1 && $0 ~ /\/Contents\/MacOS\/Lidkill( |$)/ && index($0, mine) != 1 { print pid }
+    '
+}
+
+# Other copies of the app (same bundle id) that can fight over the menu bar.
+duplicate_apps() {
+    local p
+    {
+        printf '%s\n' /Applications/Lidkill.app "$HOME/Applications/Lidkill.app" \
+            "$HOME/Desktop/Lidkill.app" "$HOME/Downloads/Lidkill.app"
+        [ "${1:-}" = deep ] && /usr/bin/mdfind "kMDItemCFBundleIdentifier == '$MENU_LABEL'" 2>/dev/null
+    } | /usr/bin/sort -u | while IFS= read -r p; do
+        case "$p" in */.Trash/*|*/.lidkill-menu.*) continue ;; esac
+        [ -d "$p" ] && [ "$p" != "$MENU_APP" ] && printf '%s\n' "$p"
+    done
+}
+
+# One value from the file the menu app writes about its own icon.
+menu_state_get() {
+    /usr/bin/awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$MENU_STATE" 2>/dev/null
+}
+
+# visible | hidden | unknown (state must belong to the running app).
+icon_state() {
+    local pid state
+    pid=$(menu_pid)
+    if [ -n "$pid" ] && [ "$(menu_state_get pid)" = "$pid" ]; then state=$(menu_state_get icon); fi
+    echo "${state:-unknown}"
+}
+
+icon_advice() {
+    cat <<EOF
+  The menu bar icon is hidden ($(menu_state_get reason)). On a Mac with a notch, macOS
+  hides the rightmost-added icons when the bar is full. Lidkill switched to a
+  Dock icon + Lidkill Controls window so you can still reach every setting.
+  To get the icon back: hold ⌘ and drag unused icons off the bar, or turn items off
+  in System Settings > Control Center / Menu Bar, then run: lidkill menu
+EOF
+}
+
+source_hash() {
+    ( cd "$APP_DIR" && /usr/bin/shasum -a 256 menu/build.sh menu/Info.plist menu/MenuApp.swift \
+        menu/MenuBar.swift menu/LidPage.swift menu/Lidkill.png lid-events.c 2>/dev/null
+      /usr/bin/uname -m; /usr/bin/sw_vers -productVersion ) | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1
+}
+
+# ---------------------------------------------------------------- commands
+
 cmd_install() {
-    local assets helper menu_asset updating=0 macos pid tries
+    local assets helper menu_asset updating=0 macos pid tries force=0 hash build_menu=1 build_helper=1 stray
+    [ "${1:-}" = --force ] && force=1
     [ "$(/usr/bin/uname -s)" = Darwin ] || die "Lidkill requires macOS 12 or later"
     macos=$(/usr/bin/sw_vers -productVersion) || die "cannot read macOS version"
     [ "${macos%%.*}" -ge 12 ] || die "Lidkill requires macOS 12 or later"
@@ -216,7 +345,7 @@ cmd_install() {
     fi
 
     mkdir -p "$APP_DIR" "$BIN_DIR" "$HOME/Library/LaunchAgents" \
-             "$(dirname "$CFG")" "$(dirname "$LOG")" || die "mkdir failed"
+             "$CFG_DIR" "$(dirname "$LOG")" || die "mkdir failed"
 
     [ ! -d "$MENU_APP" ] || updating=1
     mkdir -p "$APP_DIR/menu" || die "cannot create menu source directory"
@@ -226,22 +355,30 @@ cmd_install() {
                 || die "cannot store menu source: $menu_asset"
         fi
     done
-    /bin/bash "$APP_DIR/menu/build.sh" "$MENU_APP" || die "could not build the menu bar app"
-
-    [ "$assets/watcher.sh" -ef "$APP_DIR/watcher.sh" ] \
-        || /usr/bin/install -m 0755 "$assets/watcher.sh" "$APP_DIR/watcher.sh" \
-        || die "cannot install watcher"
-
     if [ -f "$assets/lid-events.c" ] && ! [ "$assets/lid-events.c" -ef "$APP_DIR/lid-events.c" ]; then
         /usr/bin/install -m 0644 "$assets/lid-events.c" "$APP_DIR/lid-events.c" \
             || die "cannot store the lid event monitor source"
     fi
 
-    if [ -f "$APP_DIR/lid-events.c" ] && /usr/bin/xcode-select -p >/dev/null 2>&1 \
+    # Rebuild only what changed: the sources, CPU and macOS version are hashed.
+    hash=$(source_hash)
+    if [ "$force" != 1 ] && [ "$(cat "$APP_DIR/build-hash" 2>/dev/null)" = "$hash" ]; then
+        [ -x "$MENU_APP/Contents/MacOS/Lidkill" ] && /usr/bin/codesign --verify "$MENU_APP" 2>/dev/null && build_menu=0
+        [ -x "$APP_DIR/lid-events" ] && build_helper=0
+    fi
+    if [ "$build_menu" = 1 ]; then
+        /bin/bash "$APP_DIR/menu/build.sh" "$MENU_APP" || die "could not build the menu bar app"
+    fi
+
+    [ "$assets/watcher.sh" -ef "$APP_DIR/watcher.sh" ] \
+        || /usr/bin/install -m 0755 "$assets/watcher.sh" "$APP_DIR/watcher.sh" \
+        || die "cannot install watcher"
+
+    if [ "$build_helper" = 1 ] && [ -f "$APP_DIR/lid-events.c" ] && /usr/bin/xcode-select -p >/dev/null 2>&1 \
         && /usr/bin/xcrun --find clang >/dev/null 2>&1; then
         helper=$(mktemp "$APP_DIR/.lid-events.XXXXXX") || die "mktemp failed"
         if /usr/bin/xcrun --sdk macosx clang -O2 -Wall -Wextra -framework IOKit -framework CoreFoundation \
-            "$APP_DIR/lid-events.c" -o "$helper" && chmod 0755 "$helper" \
+            -framework ApplicationServices "$APP_DIR/lid-events.c" -o "$helper" && chmod 0755 "$helper" \
             && mv -f "$helper" "$APP_DIR/lid-events"; then
             ok "IOKit lid event monitor ready."
         else
@@ -249,6 +386,8 @@ cmd_install() {
             warn "could not build the IOKit monitor; the watcher can use polling"
         fi
     fi
+    printf '%s\n' "$hash" >"$APP_DIR/build-hash"
+    [ "$build_menu$build_helper" != 00 ] || echo "Menu app and lid monitor are up to date."
 
     [ "$assets/com.lidkill.watcher.plist" -ef "$APP_DIR/com.lidkill.watcher.plist" ] \
         || /usr/bin/install -m 0644 "$assets/com.lidkill.watcher.plist" \
@@ -273,19 +412,33 @@ cmd_install() {
     fi
     if [ ! -f "$CFG" ]; then
         cat >"$CFG" <<'EOF'
-# lidkill settings
+# lidkill settings - change them with `lidkill set <name> <value>`, `lidkill setup`,
+# or the menu bar. `lidkill config` explains every one.
 # MODE: poweroff | reboot | hard | hard-restart | nuke
 MODE=poweroff
 # seconds the lid must stay closed before firing
 DELAY=1
 # 1 = only log what would happen, never kill
 DRYRUN=0
+# any | battery | ac - only act on this power source
+WHEN_POWER=any
+# 1 = do nothing while an external display is connected (clamshell use)
+IGNORE_EXTERNAL=0
+# 1 = notification and sound when a countdown starts
+NOTIFY=0
 EOF
     fi
 
     [ "$SELF" -ef "$BIN" ] || /usr/bin/install -m 0755 "$SELF" "$BIN" || die "cannot install $BIN"
+    if [ -d "$SRC/.git" ] && [ "$SRC" != "$APP_DIR" ] && [ "$SRC" != "$BIN_DIR" ]; then
+        printf '%s\n' "$SRC" >"$SOURCE_FILE"
+        /usr/bin/git -C "$SRC" rev-parse --short HEAD >"$APP_DIR/revision" 2>/dev/null || true
+    fi
 
-    /bin/rm -f "$MENU_READY" || die "cannot reset menu startup status"
+    # Two menu apps fight over the bar: stop any copy that is not ours.
+    for stray in $(stray_pids); do kill "$stray" 2>/dev/null || true; done
+
+    /bin/rm -f "$MENU_READY" "$MENU_STATE" || die "cannot reset menu startup status"
     install_menu_agent || warn "sign-in launch could not be enabled. Run: $BIN doctor"
     if menu_session; then
         if [ "$updating" = 1 ]; then
@@ -299,6 +452,10 @@ EOF
             sleep 0.25
         done
         [ -n "$pid" ] || die "menu controls did not become ready. Run: $BIN doctor"
+        for ((tries = 0; tries < 24; tries++)); do
+            [ "$(icon_state)" != unknown ] && break
+            sleep 0.25
+        done
     else
         warn "No macOS desktop session. Run $BIN menu after signing in."
     fi
@@ -321,12 +478,31 @@ EOF
             echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec zsh"
             echo ;;
     esac
-    printf '\n  Open the Lidkill menu bar icon to configure or arm it. Setup status: %s doctor\n' "$BIN"
+    if [ -n "$(duplicate_apps)" ]; then
+        warn "another Lidkill.app exists ($(duplicate_apps | /usr/bin/head -n 1)). It can hijack the menu bar: run $BIN doctor --fix"
+    fi
+    if [ "$(icon_state)" = hidden ]; then
+        warn "menu bar icon is not visible"
+        icon_advice
+        echo
+    fi
+    printf '  Configure with: %s setup   |   Check health: %s doctor\n' "$BIN" "$BIN"
 }
 
 cmd_on() {
-    local force=0
-    [ "${1:-}" = "--force" ] && force=1
+    local force=0 span= secs=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=1 ;;
+            --for) shift; span=${1:-}; [ -n "$span" ] || die "usage: lidkill on --for <30m|2h|1d>" ;;
+            --for=*) span=${1#--for=} ;;
+            *) die "usage: lidkill on [--force] [--for <30m|2h|1d>]" ;;
+        esac
+        shift
+    done
+    if [ -n "$span" ]; then
+        secs=$(parse_duration "$span") || die "--for takes 1m to 7d, for example 30m, 2h or 1d"
+    fi
     is_installed || die "not installed yet - run: $SELF install"
     load_cfg
 
@@ -345,8 +521,8 @@ cmd_on() {
     local tmp
     tmp=$(mktemp) || die "mktemp failed"
     cat >"$tmp" <<EOF
-# Managed by lidkill. Allows the lid watcher to power off / reboot without a prompt.
-$(id -un) ALL=(root) NOPASSWD: /sbin/shutdown -h now, /sbin/shutdown -r now, /sbin/halt -q, /sbin/reboot -q, /sbin/halt -nq
+# Managed by lidkill. Allows the lid watcher to power off / reboot, and to restore normal sleep, without a prompt.
+$(id -un) ALL=(root) NOPASSWD: /sbin/shutdown -h now, /sbin/shutdown -r now, /sbin/halt -q, /sbin/reboot -q, /sbin/halt -nq, /usr/bin/pmset -a disablesleep 0
 EOF
 
     /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "sudoers syntax check failed"; }
@@ -355,6 +531,12 @@ EOF
     rm -f "$tmp"
 
     /usr/bin/sudo /usr/bin/pmset -a disablesleep 1 || die "pmset -a disablesleep 1 failed"
+
+    if [ -n "$secs" ]; then
+        printf '%s\n' "$(($(/bin/date +%s) + secs))" >"$ARM_UNTIL" || die "cannot write $ARM_UNTIL"
+    else
+        /bin/rm -f "$ARM_UNTIL"
+    fi
 
     launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1
     launchctl enable "$DOMAIN/$LABEL" >/dev/null 2>&1
@@ -367,12 +549,18 @@ EOF
     fi
 
     ok "ARMED. Closing the lid will now run: ${MODE}"
+    [ -z "$secs" ] || echo "Disarms itself in $(fmt_duration "$secs")."
     [ "$DRYRUN" = 1 ] && warn "dry-run is ON - it will only log, not kill"
     echo
     echo "Disarm with: $BIN off"
 }
 
 cmd_off() {
+    local prompt=1
+    [ "${1:-}" = --no-prompt ] && prompt=0
+    # Sleep first: if the password is refused we stay armed instead of half-disarmed.
+    restore_sleep "$prompt" || die "restoring sleep needs your password. Run in Terminal: lidkill off"
+
     if agent_loaded; then
         launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 \
             || launchctl unload -w "$AGENT" >/dev/null 2>&1 \
@@ -384,22 +572,21 @@ cmd_off() {
 
     launchctl disable "$DOMAIN/$LABEL" >/dev/null 2>&1 \
         || warn "could not disable automatic watcher launch at sign-in"
-    /bin/rm -f "$PENDING"
-    need_sudo "Restoring normal lid sleep needs your password."
-    /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || die "pmset failed"
+    /bin/rm -f "$PENDING" "$ARM_UNTIL"
     ok "DISARMED. Lid close sleeps normally again."
     echo "SleepDisabled = $(sleep_disabled)"
 }
 
 cmd_status() {
     load_cfg
-    local lid sd job pid
+    local lid sd job pid left
     lid=$(lid_state)
     sd=$(sleep_disabled)
     job=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null) || job=
     pid=$(printf '%s\n' "$job" | /usr/bin/awk '/^[[:space:]]*pid = / {print $3; exit}')
+    left=$(arm_timer_left)
 
-    echo "${B}lidkill${N}"
+    echo "${B}lidkill${N} $VERSION"
     if is_installed && [ -n "$job" ]; then
         echo "  state        ${G}ARMED${N}"
     elif is_installed; then
@@ -407,10 +594,16 @@ cmd_status() {
     else
         echo "  state        ${D}not installed${N}"
     fi
+    [ "$left" -eq 0 ] || printf '  disarms in   %s\n' "$(fmt_duration "$left")"
     printf '  lid          %s\n' "$lid"
+    printf '  power        %s\n' "$(power_source)"
     printf '  mode         %s\n' "$MODE"
     printf '  delay        %ss\n' "$DELAY"
     printf '  dry-run      %s\n' "$([ "$DRYRUN" = 1 ] && echo yes || echo no)"
+    printf '  only when    %s power\n' "$([ "$WHEN_POWER" = any ] && echo any || echo "$WHEN_POWER")"
+    printf '  external     %s\n' "$([ "$IGNORE_EXTERNAL" = 1 ] && echo 'ignore lid close when a display is connected' || echo 'not considered')"
+    printf '  notify       %s\n' "$(onoff "$NOTIFY")"
+    [ -z "$HOOK" ] || printf '  hook         %s\n' "$HOOK"
     if [ -n "$pid" ]; then
         printf '  watcher      running (pid %s)\n' "$pid"
     else
@@ -468,6 +661,132 @@ cmd_dryrun() {
         off|0|no)  set_cfg DRYRUN 0; ok "dry-run off (will really kill)" ;;
         *) die "usage: lidkill dryrun <on|off>" ;;
     esac
+}
+
+cmd_when() {
+    case "${1:-}" in
+        any|battery|ac) set_cfg WHEN_POWER "$1"; ok "only acting on: $1 power" ;;
+        *) die "usage: lidkill when <any|battery|ac>" ;;
+    esac
+}
+
+cmd_external() {
+    case "${1:-}" in
+        on|1|yes)  set_cfg IGNORE_EXTERNAL 1; ok "lid close is ignored while an external display is connected" ;;
+        off|0|no)  set_cfg IGNORE_EXTERNAL 0; ok "external displays no longer matter" ;;
+        *) die "usage: lidkill external <on|off>" ;;
+    esac
+    [ -x "$APP_DIR/lid-events" ] || warn "the IOKit helper is not built; run lidkill install after installing the Xcode tools"
+}
+
+cmd_notify() {
+    case "${1:-}" in
+        on|1|yes)  set_cfg NOTIFY 1; ok "notify on" ;;
+        off|0|no)  set_cfg NOTIFY 0; ok "notify off" ;;
+        *) die "usage: lidkill notify <on|off>" ;;
+    esac
+}
+
+cmd_hook() {
+    case "${1:-}" in
+        off|none|'') [ "${1:-}" ] || die "usage: lidkill hook <path-to-script|off>"
+                     set_cfg HOOK ""; ok "hook removed" ;;
+        *) [ -f "$1" ] && [ -x "$1" ] || die "$1 must be an executable file (chmod +x)"
+           set_cfg HOOK "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+           ok "hook = $1 (runs just before the action; output goes to the log; 5s limit)" ;;
+    esac
+}
+
+cmd_set() {
+    local name=${1:-}
+    [ $# -gt 0 ] && shift
+    case "$name" in
+        mode|delay|dryrun|when|external|notify|hook) "cmd_$name" "$@" ;;
+        page-reopen|login) "cmd_${name//-/_}" "$@" ;;
+        *) die "unknown setting '$name'. See: lidkill config" ;;
+    esac
+}
+
+cmd_config() {
+    load_cfg
+    local lid_page=
+    [ -s "$PAGE_URL" ] && lid_page=" ${D}(Lid Page profile)${N}"
+    echo "${B}Settings${N}  change with: lidkill set <name> <value>"
+    printf '  %-9s %-14s %s\n' mode "$MODE" "what closing the lid does: poweroff reboot hard hard-restart nuke$lid_page"
+    printf '  %-9s %-14s %s\n' delay "${DELAY}s" "how long the lid must stay shut first (0-60)"
+    printf '  %-9s %-14s %s\n' dryrun "$(onoff "$DRYRUN")" "on = only log, never act"
+    printf '  %-9s %-14s %s\n' when "$WHEN_POWER" "act only on this power source: any battery ac"
+    printf '  %-9s %-14s %s\n' external "$(onoff "$IGNORE_EXTERNAL")" "on = do nothing while an external display is connected"
+    printf '  %-9s %-14s %s\n' notify "$(onoff "$NOTIFY")" "on = notification and sound when a countdown starts"
+    printf '  %-9s %-14s %s\n' hook "${HOOK:-off}" "script run just before the action"
+    echo
+    echo "Quick start: lidkill preset safe|desk|guard|battery   or   lidkill setup"
+}
+
+apply_preset() {
+    set_cfg MODE "$1"; set_cfg DELAY "$2"; set_cfg WHEN_POWER "$3"
+    set_cfg IGNORE_EXTERNAL "$4"; set_cfg NOTIFY "$5"
+}
+
+cmd_preset() {
+    case "${1:-}" in
+        safe)    apply_preset poweroff 5 any 0 1 ;;
+        desk)    apply_preset poweroff 3 any 1 1 ;;
+        guard)   apply_preset hard 0 any 0 0 ;;
+        battery) apply_preset poweroff 3 battery 0 1 ;;
+        ''|list)
+            cat <<'EOF'
+Presets (lidkill preset <name>):
+  safe     clean power off after 5s, with a notification
+  desk     clean power off after 3s, but ignored while an external display is
+           connected - safe for clamshell use at a desk
+  guard    hard shutdown immediately, silent - for a locked-down, unattended Mac
+  battery  clean power off after 3s, only when running on battery
+Presets never change dry-run, the hook, or the Lid Page website.
+EOF
+            return 0 ;;
+        *) die "unknown preset '$1'. Choose safe, desk, guard or battery." ;;
+    esac
+    ok "preset $1 applied"
+    cmd_config
+}
+
+ask() {  # ask <var> <prompt> <default>
+    local reply
+    read -r -p "$2 [$3]: " reply || reply=
+    printf -v "$1" '%s' "${reply:-$3}"
+}
+
+cmd_setup() {
+    [ -t 0 ] && [ -t 1 ] || die "setup is interactive. Without a terminal use: lidkill preset <name>, or lidkill set <name> <value>"
+    load_cfg
+    local choice delay when external notify mode_default=1
+    case "$MODE" in reboot) mode_default=2 ;; hard) mode_default=3 ;; hard-restart) mode_default=4 ;; esac
+    echo "${B}lidkill setup${N} - press Return to keep the value in [brackets]."
+    echo
+    echo "What should closing the lid do?"
+    echo "  1) power off      clean shutdown"
+    echo "  2) restart        clean reboot"
+    echo "  3) hard shutdown  ungraceful, disk cache still flushed"
+    echo "  4) hard restart   ungraceful reboot"
+    ask choice "Choice" "$mode_default"
+    case "$choice" in
+        1) MODE=poweroff ;; 2) MODE=reboot ;; 3) MODE=hard ;; 4) MODE=hard-restart ;;
+        *) die "choose 1-4 (use 'lidkill mode nuke' for emergency shutdown)" ;;
+    esac
+    ask delay "Seconds the lid must stay shut first (0-60)" "$DELAY"
+    case "$delay" in ''|*[!0-9]*) die "delay must be a whole number" ;; esac
+    [ "$delay" -le 60 ] || die "delay must be 60 or less"
+    ask when "Act on which power source? (any/battery/ac)" "$WHEN_POWER"
+    case "$when" in any|battery|ac) ;; *) die "choose any, battery or ac" ;; esac
+    ask external "Ignore lid close while an external display is connected? (y/n)" "$([ "$IGNORE_EXTERNAL" = 1 ] && echo y || echo n)"
+    ask notify "Show a notification when a countdown starts? (y/n)" "$([ "$NOTIFY" = 1 ] && echo y || echo n)"
+    apply_preset "$MODE" "$delay" "$when" "$([ "$external" = y ] && echo 1 || echo 0)" "$([ "$notify" = y ] && echo 1 || echo 0)"
+    echo
+    ok "saved."
+    cmd_config
+    echo
+    echo "Try it safely: lidkill dryrun on && lidkill on --for 30m && lidkill test 30"
 }
 
 cmd_test() {
@@ -530,8 +849,32 @@ cmd_login() {
     esac
 }
 
+doctor_fix() {
+    local pid app moved=0
+    echo "Repairing..."
+    for pid in $(stray_pids); do
+        kill "$pid" 2>/dev/null && echo "  stopped stray Lidkill app (pid $pid)"
+    done
+    while IFS= read -r app; do
+        [ -n "$app" ] || continue
+        if /bin/mv "$app" "$HOME/.Trash/Lidkill-$(/bin/date +%s).app" 2>/dev/null; then
+            echo "  moved duplicate $app to the Trash"; moved=1
+        else
+            warn "could not move $app; drag it to the Trash yourself"
+        fi
+    done < <(duplicate_apps deep)
+    [ "$moved" = 0 ] || /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -gc >/dev/null 2>&1 || true
+    /usr/bin/defaults delete "$MENU_LABEL" >/dev/null 2>&1 && echo "  cleared saved menu bar position"
+    cmd_install --force || die "reinstall failed"
+}
+
 cmd_doctor() {
-    local pid
+    local pid fix=0 dups strays hints=() icon sd
+    [ "${1:-}" = --fix ] && fix=1
+    [ "$fix" = 0 ] || doctor_fix
+    printf 'lidkill %s' "$VERSION"
+    [ ! -f "$APP_DIR/revision" ] || printf ' (%s)' "$(cat "$APP_DIR/revision")"
+    printf '\n'
     printf 'Platform: macOS %s (%s)\n' "$(/usr/bin/sw_vers -productVersion)" "$(/usr/bin/uname -m)"
     if menu_session; then echo "Desktop session: available"; else echo "Desktop session: unavailable"; fi
     if [ -x "$MENU_APP/Contents/MacOS/Lidkill" ]; then
@@ -544,11 +887,21 @@ cmd_doctor() {
             else
                 echo "Menu controls: waiting for the app to read its config"
             fi
+            icon=$(icon_state)
+            case "$icon" in
+                visible) echo "Menu icon: visible" ;;
+                hidden)
+                    printf 'Menu icon: HIDDEN (%s) - Dock icon and Controls window are active\n' "$(menu_state_get reason)"
+                    hints+=("Free menu bar space: hold ⌘ and drag unused icons off the bar, then run: lidkill menu") ;;
+                *) echo "Menu icon: not checked yet" ;;
+            esac
         else
             printf 'Menu bar: stopped. Open with %s menu\n' "$BIN"
+            hints+=("Start the menu app: lidkill menu")
         fi
     else
         echo "Menu app: missing. Run ./lidkill menu from the repo."
+        hints+=("Install: ./lidkill install from the repo")
     fi
     if [ ! -f "$MENU_AGENT" ]; then
         echo "Launch at sign-in: missing. Run ./lidkill install from the repo."
@@ -561,11 +914,125 @@ cmd_doctor() {
     else
         echo "Launch at sign-in: disabled"
     fi
+    dups=$(duplicate_apps deep)
+    if [ -n "$dups" ]; then
+        printf 'Duplicate apps: %s\n' "$(printf '%s' "$dups" | /usr/bin/paste -sd ',' - | sed 's/,/, /g')"
+        hints+=("Another Lidkill.app can hijack the menu bar: lidkill doctor --fix")
+    fi
+    strays=$(stray_pids)
+    if [ -n "$strays" ]; then
+        printf 'Stray Lidkill processes: %s\n' "$(printf '%s' "$strays" | /usr/bin/paste -sd ',' - | sed 's/,/, /g')"
+        hints+=("Stop the stray menu app: lidkill doctor --fix")
+    fi
+    if [ -x "$APP_DIR/lid-events" ]; then echo "Lid detector: IOKit events"; else echo "Lid detector: polling (IOKit helper not built)"; fi
     if agent_loaded; then echo "Watcher: armed"; else echo "Watcher: disarmed"; fi
+    sd=$(sleep_disabled)
+    if agent_loaded && [ "${sd:-0}" != 1 ]; then
+        echo "Sleep: NOT disabled while armed - the Mac will sleep on lid close"
+        hints+=("Re-arm to apply pmset: lidkill on")
+    fi
+    if agent_loaded && [ ! -f "$SUDOERS" ]; then
+        echo "Sudoers rule: missing while armed - the action cannot run"
+        hints+=("Re-arm to recreate the sudoers rule: lidkill on")
+    fi
     if [ -s "$MENU_LOG" ]; then
         echo "Recent sign-in errors"
         /usr/bin/tail -n 5 "$MENU_LOG"
     fi
+    if [ "${#hints[@]}" -gt 0 ]; then
+        echo "Next steps"
+        printf '  - %s\n' "${hints[@]}"
+    fi
+    echo "Need help? Run: lidkill report"
+}
+
+# Everything needed to understand a failed setup, with your name and home removed.
+report_body() {
+    local f
+    echo "== lidkill report =="
+    echo "date: $(/bin/date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "version: $VERSION $(cat "$APP_DIR/revision" 2>/dev/null)"
+    echo
+    echo "== system =="
+    echo "macOS: $(/usr/bin/sw_vers -productVersion) ($(/usr/bin/sw_vers -buildVersion)) $(/usr/bin/uname -m)"
+    echo "model: $(/usr/sbin/sysctl -n hw.model 2>/dev/null)"
+    echo "power: $(power_source)   lid: $(lid_state)   SleepDisabled: $(sleep_disabled)"
+    echo "desktop session: $(menu_session && echo yes || echo no)"
+    echo "developer tools: $(/usr/bin/xcode-select -p 2>&1)"
+    echo "swiftc: $(/usr/bin/xcrun swiftc --version 2>&1 | /usr/bin/head -n 1)"
+    echo "external displays: $([ -x "$APP_DIR/lid-events" ] && "$APP_DIR/lid-events" --displays 2>&1 || echo n/a)"
+    echo
+    echo "== install =="
+    for f in "$BIN" "$APP_DIR/watcher.sh" "$APP_DIR/lid-events" "$MENU_APP/Contents/MacOS/Lidkill" "$AGENT" "$MENU_AGENT" "$CFG" "$SUDOERS"; do
+        if [ -e "$f" ]; then echo "present  $f"; else echo "MISSING  $f"; fi
+    done
+    echo "duplicate apps: $(duplicate_apps deep | /usr/bin/paste -sd ',' -)"
+    echo "stray processes: $(stray_pids | /usr/bin/paste -sd ',' -)"
+    echo
+    echo "== menu bar icon =="
+    if [ -f "$MENU_STATE" ]; then /bin/cat "$MENU_STATE"; else echo "no menu-state file (app never reported)"; fi
+    echo
+    echo "== doctor =="
+    cmd_doctor 2>&1
+    echo
+    echo "== launchd =="
+    for f in "$LABEL" "$MENU_LABEL"; do
+        echo "-- $f"
+        launchctl print "$DOMAIN/$f" 2>&1 | /usr/bin/grep -E 'state =|pid =|last exit|runs =|program =|Could not' | /usr/bin/head -n 8
+    done
+    launchctl print-disabled "$DOMAIN" 2>/dev/null | /usr/bin/grep -i lidkill
+    echo
+    echo "== config =="
+    /bin/cat "$CFG" 2>&1
+    echo
+    echo "== watcher log (last 60) =="
+    /usr/bin/tail -n 60 "$LOG" 2>&1
+    echo
+    echo "== menu log (last 30) =="
+    /usr/bin/tail -n 30 "$MENU_LOG" 2>&1
+    echo
+    echo "== crash reports =="
+    f=$(/bin/ls -1t "$HOME"/Library/Logs/DiagnosticReports/Lidkill* 2>/dev/null | /usr/bin/head -n 1)
+    if [ -n "$f" ]; then echo "$f"; /usr/bin/head -n 60 "$f"; else echo none; fi
+}
+
+cmd_report() {
+    local out="$HOME/Library/Logs/lidkill-report.txt" user
+    user=$(id -un)
+    if [ "${1:-}" = --stdout ]; then
+        report_body | /usr/bin/sed -e "s|$HOME|~|g" -e "s|/Users/$user|/Users/<user>|g"
+        return 0
+    fi
+    mkdir -p "$(dirname "$out")"
+    report_body 2>&1 | /usr/bin/sed -e "s|$HOME|~|g" -e "s|/Users/$user|/Users/<user>|g" >"$out" \
+        || die "could not write $out"
+    ok "Report saved: ~${out#"$HOME"}"
+    if /usr/bin/pbcopy <"$out" 2>/dev/null; then
+        echo "Copied to the clipboard - paste it into your bug report. Your user name and home folder are removed."
+    else
+        echo "Attach that file to your bug report. Your user name and home folder are removed."
+    fi
+}
+
+cmd_update() {
+    local repo before after
+    repo=$(/usr/bin/head -n 1 "$SOURCE_FILE" 2>/dev/null)
+    { [ -n "$repo" ] && [ -d "$repo/.git" ]; } \
+        || die "no Lidkill clone is recorded. In your clone run: git pull --ff-only && ./lidkill install"
+    before=$(/usr/bin/git -C "$repo" rev-parse --short HEAD 2>/dev/null)
+    /usr/bin/git -C "$repo" pull --ff-only || die "git pull failed (local changes?) in $repo"
+    after=$(/usr/bin/git -C "$repo" rev-parse --short HEAD 2>/dev/null)
+    if [ "$before" = "$after" ] && [ "${1:-}" != --force ]; then
+        echo "Already up to date ($after)."
+        return 0
+    fi
+    "$repo/lidkill" install
+}
+
+cmd_version() {
+    printf 'lidkill %s' "$VERSION"
+    [ ! -f "$APP_DIR/revision" ] || printf ' (%s)' "$(cat "$APP_DIR/revision")"
+    printf '\n'
 }
 
 cmd_cancel() {
@@ -590,6 +1057,7 @@ cmd_page_reopen() {
     esac
 }
 
+# One value per line for the menu bar app; new fields only ever go at the end.
 cmd_menu_status() {
     local armed=0 at_login=0 skip_next=0 cancel_on_reopen=0
     load_cfg
@@ -597,7 +1065,8 @@ cmd_menu_status() {
     menu_login_enabled && at_login=1
     [ ! -f "$SKIP" ] || skip_next=1
     [ "$PAGE_CANCEL_ON_REOPEN" != 1 ] || cancel_on_reopen=1
-    printf '%s\n' "$armed" "$MODE" "$DELAY" "$DRYRUN" "$at_login" "$skip_next" "$cancel_on_reopen"
+    printf '%s\n' "$armed" "$MODE" "$DELAY" "$DRYRUN" "$at_login" "$skip_next" "$cancel_on_reopen" \
+        "$WHEN_POWER" "$IGNORE_EXTERNAL" "$NOTIFY" "$(arm_timer_left)"
 }
 
 cmd_logs() {
@@ -616,14 +1085,19 @@ cmd_uninstall() {
     pid=$(menu_pid)
     [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
 
+    local slept=0
+    restore_sleep 0 && slept=1
     if /usr/bin/sudo -v 2>/dev/null; then
-        /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || warn "could not reset pmset"
+        [ "$slept" = 1 ] || /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || warn "could not reset pmset"
         /usr/bin/sudo rm -f "$SUDOERS"
     else
-        warn "skipping root cleanup; run: sudo pmset -a disablesleep 0 && sudo rm -f $SUDOERS"
+        [ "$slept" = 1 ] || [ "$(sleep_disabled)" != 1 ] || warn "could not restore sleep; run: sudo pmset -a disablesleep 0"
+        [ ! -f "$SUDOERS" ] || warn "left the harmless sudoers rule; remove it with: sudo rm -f $SUDOERS"
     fi
 
-    rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG" "$PENDING" "$SKIP" "$PAGE_URL" "$MENU_READY" "$BIN" "$LOG" "$MENU_LOG"
+    /usr/bin/defaults delete "$MENU_LABEL" >/dev/null 2>&1
+    rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG_DIR" "$BIN" "$LOG" "$MENU_LOG" \
+        "$HOME/Library/Logs/lidkill-report.txt"
     rm -f /usr/local/bin/lidkill 2>/dev/null
     ok "removed. Normal lid behaviour restored."
 }
@@ -641,10 +1115,21 @@ case "$cmd" in
     mode)               cmd_mode "$@" ;;
     delay)              cmd_delay "$@" ;;
     dryrun)             cmd_dryrun "$@" ;;
+    when)               cmd_when "$@" ;;
+    external)           cmd_external "$@" ;;
+    notify)             cmd_notify "$@" ;;
+    hook)               cmd_hook "$@" ;;
+    set)                cmd_set "$@" ;;
+    config|settings)    cmd_config ;;
+    preset)             cmd_preset "$@" ;;
+    setup|wizard)       cmd_setup ;;
     test)               cmd_test "$@" ;;
     menu)               cmd_menu ;;
     login)              cmd_login "$@" ;;
-    doctor)             cmd_doctor ;;
+    doctor)             cmd_doctor "$@" ;;
+    report)             cmd_report "$@" ;;
+    update|upgrade)     cmd_update "$@" ;;
+    version|--version|-v) cmd_version ;;
     cancel)             cmd_cancel ;;
     skip)               cmd_skip "$@" ;;
     page-reopen)        cmd_page_reopen "$@" ;;
