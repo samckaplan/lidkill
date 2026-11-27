@@ -3,6 +3,7 @@ import AppKit
 @main
 enum MenuSmoke {
     @MainActor static func main() {
+        setenv("LIDKILL_NO_POPUP", "1", 1)  // performClick would block in menu tracking
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         // The icon must render from the shipped artwork, not fall back to a system symbol.
@@ -37,16 +38,17 @@ enum MenuSmoke {
                     fail("missing menu item: " + title)
                 }
                 if ProcessInfo.processInfo.environment["LIDKILL_EXPECT_FALLBACK"] != nil {
-                    // Simulated hidden icon: the Dock icon and controls window must take over.
-                    await waitFor("dock fallback") { NSApp.activationPolicy() == .regular }
-                    await waitFor("fallback controls window") { menuBar.controlsWindow?.isVisible == true }
-                    print("Hidden-icon fallback passed.")
+                    // Simulated hidden icon: Lidkill must re-add it.
+                    await waitFor("icon repair") { menuBar.iconRepairs >= 1 }
+                    if NSApp.activationPolicy() != .accessory { fail("hidden icon must not add a Dock icon") }
+                    print("Hidden-icon repair passed.")
                     exit(0)
                 }
                 guard let url = URL(string: "lidkill://controls") else { fail("invalid controls URL") }
                 menuBar.application(app, open: [url])
-                await waitFor("controls window") { menuBar.controlsWindow?.isVisible == true }
-                print("Menu bar item, settings actions, and controls window passed.")
+                await waitFor("menu open request") { menuBar.openMenuRequests == 1 }
+                if NSApp.activationPolicy() != .accessory { fail("Lidkill must stay a menu bar app") }
+                print("Menu bar item, settings actions, and menu request passed.")
                 exit(0)
             }
         }

@@ -9,11 +9,14 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         .appendingPathComponent("Library/Logs/lidkill.log")
     private let commandQueue = DispatchQueue(label: "com.lidkill.menubar.commands")
     let menu = NSMenu()
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    private var showControlsWhenReady = false
+    private var statusItem: NSStatusItem!
+    private var popUpWhenReady = false
     private var controlsReady = false
-    private(set) var controlsWindow: NSWindow?
-    var hasVisibleStatusItem: Bool { statusItem.isVisible && statusItem.button != nil && statusItem.menu === menu }
+    /// How many times the icon was found hidden and moved back to the far-right slot.
+    private(set) var iconRepairs = 0
+    /// How many times `lidkill menu` asked for the menu to open.
+    private(set) var openMenuRequests = 0
+    var hasVisibleStatusItem: Bool { statusItem?.isVisible == true && statusItem.button != nil && statusItem.menu === menu }
     private var configSource: DispatchSourceFileSystemObject?
     private var timer: Timer?
     private var previewDeadline: TimeInterval?
@@ -57,24 +60,9 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // A saved position from an older build can park the icon where the notch hides it.
-        for key in UserDefaults.standard.dictionaryRepresentation().keys
-            where key.hasPrefix("NSStatusItem") && key.contains("Lidkill") {
-            UserDefaults.standard.removeObject(forKey: key)
-        }
-        if let icon = MenuBar.makeGlyph() {
-            statusItem.button?.image = icon
-        } else {
-            statusItem.button?.image = NSImage(systemSymbolName: "power", accessibilityDescription: "Lidkill")
-        }
-        statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        statusItem.button?.setAccessibilityLabel("Lidkill")
-        statusItem.button?.toolTip = "Lidkill"
-        statusItem.behavior = []
-        statusItem.isVisible = true
+        makeStatusItem()
         menu.autoenablesItems = false
         menu.delegate = self
-        statusItem.menu = menu
 
         headline = add("Lidkill", to: menu)
         headline.isEnabled = false
@@ -141,69 +129,46 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeCountdown()
         reloadCountdown()
         refreshSettings()
-        if showControlsWhenReady { showControls() }
+        if popUpWhenReady { DispatchQueue.main.async { [weak self] in self?.popUpMenu() } }
+    }
+
+    /// A saved slot can park the icon off screen or behind the notch (it did after #7 added an
+    /// autosave name). Nothing is saved on purpose: forget whatever an older build left behind.
+    private func forgetSavedPositions() {
+        let defaults = UserDefaults.standard
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("NSStatusItem") {
+            defaults.removeObject(forKey: key)
+        }
+        defaults.removeObject(forKey: "LidkillIconSlotVersion")
+    }
+
+    private func makeStatusItem() {
+        if let old = statusItem { NSStatusBar.system.removeStatusItem(old) }
+        forgetSavedPositions()
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = MenuBar.makeGlyph()
+            ?? NSImage(systemSymbolName: "power", accessibilityDescription: "Lidkill")
+        item.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        item.button?.setAccessibilityLabel("Lidkill")
+        item.button?.toolTip = "Lidkill"
+        item.behavior = []
+        item.isVisible = true
+        item.menu = menu
+        statusItem = item
+        if headline != nil { refreshCountdown() }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard urls.contains(where: { $0.absoluteString == "lidkill://controls" }) else { return }
-        if headline == nil {
-            showControlsWhenReady = true
-        } else {
-            showControls()
-        }
+        openMenuRequests += 1
+        if headline == nil { popUpWhenReady = true } else { popUpMenu() }
     }
 
-    private func showControls() {
-        if controlsWindow == nil {
-            let frame = NSRect(x: 0, y: 0, width: 300, height: 214)
-            let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = "Lidkill Controls"
-            window.isReleasedWhenClosed = false
-            let note = NSTextField(wrappingLabelWithString: "")
-            note.frame = NSRect(x: 20, y: 140, width: 260, height: 58)
-            note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-            note.identifier = NSUserInterfaceItemIdentifier("note")
-            window.contentView?.addSubview(note)
-            let first = NSButton(title: "Open Lidkill Menu ▾", target: self, action: #selector(openControlsMenu(_:)))
-            let buttons = [first,
-                           NSButton(title: "Setup Status…", target: self, action: #selector(showSetupStatus)),
-                           NSButton(title: "Copy Diagnostic Report", target: self, action: #selector(copyReport))]
-            for (index, button) in buttons.enumerated() {
-                button.bezelStyle = .rounded
-                button.frame = NSRect(x: 30, y: 96 - index * 38, width: 240, height: 32)
-                window.contentView?.addSubview(button)
-            }
-            window.initialFirstResponder = first
-            window.center()
-            controlsWindow = window
-        }
-        let note = controlsWindow?.contentView?.subviews.first {
-            $0.identifier == NSUserInterfaceItemIdentifier("note")
-        } as? NSTextField
-        note?.stringValue = iconHidden
-            ? "The menu bar icon is hidden (\(iconReason)). Use these controls or the Dock icon. To restore the icon, free some menu bar space, then run: lidkill menu"
-            : "Lidkill lives in the menu bar. This window opens the same menu."
-        NSApp.activate(ignoringOtherApps: true)
-        controlsWindow?.makeKeyAndOrderFront(nil)
+    /// `lidkill menu` opens the same menu the icon shows, right under the icon.
+    private func popUpMenu() {
+        guard ProcessInfo.processInfo.environment["LIDKILL_NO_POPUP"] == nil, !iconHidden else { return }
+        statusItem.button?.performClick(nil)
     }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if headline != nil { showControls() }
-        return true
-    }
-
-    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
-        let dock = NSMenu()
-        for (title, action) in [("Open Lidkill Controls", #selector(showControlsAction)),
-                                (armed ? "Disarm…" : "Arm…", #selector(toggleArmed)),
-                                ("Setup Status…", #selector(showSetupStatus)),
-                                ("Copy Diagnostic Report", #selector(copyReport))] {
-            _ = add(title, to: dock, action: action)
-        }
-        return dock
-    }
-
-    @objc private func showControlsAction() { showControls() }
 
     // MARK: menu bar icon
 
@@ -284,17 +249,14 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func checkIcon() {
         let probe = probeStatusItem()
         iconReason = probe.reason
-        if !probe.visible && !iconHidden {
-            iconHidden = true
-            NSApp.setActivationPolicy(.regular)
-            if let url = Bundle.main.url(forResource: "Lidkill", withExtension: "png"),
-               let image = NSImage(contentsOf: url) { NSApp.applicationIconImage = image }
-            showControls()
-        } else if probe.visible && iconHidden {
-            iconHidden = false
-            NSApp.setActivationPolicy(.accessory)
+        iconHidden = !probe.visible
+        // Hidden: forget saved positions and add the icon again, twice at most per launch.
+        if iconHidden && iconRepairs < 2 {
+            iconRepairs += 1
+            makeStatusItem()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.checkIcon() }
         }
-        // While the icon is hidden keep looking: the user may free some bar space.
+        // While it stays hidden keep looking: the user may free some bar space.
         if iconHidden, iconProbeTimer == nil {
             iconProbeTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
                 self?.checkIcon()
@@ -308,7 +270,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "pid=\(getpid())",
             "icon=\(probe.visible ? "visible" : "hidden")",
             "reason=\(probe.reason)",
-            "mode=\(iconHidden ? "dock" : "menu-bar")",
+            "repairs=\(iconRepairs)",
             "frame=\(f.map { "\(Int($0.minX)),\(Int($0.minY)),\(Int($0.width)),\(Int($0.height))" } ?? "none")",
             "notch=\(NSScreen.screens.contains { $0.safeAreaInsets.top > 0 } ? "yes" : "no")",
             "screens=\(NSScreen.screens.count)",
@@ -316,10 +278,6 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
         try? Data((lines.joined(separator: "\n") + "\n").utf8)
             .write(to: configDirectory.appendingPathComponent("menu-state"), options: .atomic)
-    }
-
-    @objc private func openControlsMenu(_ button: NSButton) {
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
