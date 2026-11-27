@@ -478,6 +478,9 @@ EOF
             echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && exec zsh"
             echo ;;
     esac
+    if [ -n "$(duplicate_apps)" ]; then
+        warn "another Lidkill.app exists ($(duplicate_apps | /usr/bin/head -n 1)). It can hijack the menu bar: run $BIN doctor --fix"
+    fi
     if [ "$(icon_state)" = hidden ]; then
         warn "menu bar icon is not visible"
         icon_advice

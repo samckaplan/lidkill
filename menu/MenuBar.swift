@@ -393,6 +393,7 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.skipItem.isEnabled = available && fields.count >= 6
             self.reopenItem.isEnabled = available && fields.count >= 7 && hasPage
             let extended = available && fields.count >= 11
+            self.armForItem.isEnabled = extended && fields.first == "0"
             for item in [self.whenItem, self.externalItem, self.notifyItem, self.presetItem] {
                 item?.isEnabled = extended
             }
@@ -414,7 +415,6 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     for choice in choices { choice.state = choice.representedObject as? String == when ? .on : .off }
                 }
             }
-            self.armForItem.isEnabled = extended && !self.armed
             let remaining = self.armed && self.timerLeft > 0 ? " · \(MenuBar.format(self.timerLeft)) left" : ""
             self.headline.title = (self.armed ? "Lidkill · Armed" : "Lidkill · Disarmed") + remaining
             self.arm.title = self.armed ? "Disarm…" : "Arm…"
