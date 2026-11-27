@@ -10,6 +10,11 @@ cfg="$home/.config/lidkill/config"
 lk() { ./lidkill "$@"; }
 want() { grep -qxF -- "$1" "$cfg" || { echo "config is missing: $1" >&2; cat "$cfg" >&2; exit 1; }; }
 
+# "default" restores the factory behavior even after a test left dry-run on.
+lk dryrun on >/dev/null; lk delay 9 >/dev/null; lk mode nuke >/dev/null 2>&1; touch "$home/.config/lidkill/skip-next"
+lk preset default >/dev/null
+want MODE=poweroff; want DELAY=1; want WHEN_POWER=any; want IGNORE_EXTERNAL=0; want NOTIFY=0; want DRYRUN=0
+[ ! -e "$home/.config/lidkill/skip-next" ]
 lk preset safe >/dev/null
 want MODE=poweroff; want DELAY=5; want WHEN_POWER=any; want IGNORE_EXTERNAL=0; want NOTIFY=1
 lk preset desk >/dev/null

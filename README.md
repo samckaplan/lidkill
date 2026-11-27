@@ -18,9 +18,12 @@ cd lidkill
 ```
 
 Update later with `lidkill update` (or `git pull --ff-only && ./lidkill install`).
-Setup needs no administrator password. Fresh installs start disarmed. Existing
-config is kept, and unchanged parts are not rebuilt. If upgrading while armed,
-re-arm the watcher to pick up the update. Double-clicking `install.command`
+Setup itself needs no administrator password. **Default behavior: once armed,
+closing the lid powers the Mac off** (clean shutdown after 1 second, always). When you
+run the install in Terminal it ends by asking "Arm now?" (press Return; your password is
+needed once). Installs run by scripts or agents have no terminal, so they stay disarmed.
+Existing config is kept, and unchanged parts are not rebuilt. If upgrading while armed,
+the install offers to re-arm so the update's sudoers rule applies. Double-clicking `install.command`
 in Finder also runs setup.
 
 ### Copy-paste prompt for an AI agent
@@ -30,7 +33,8 @@ in Finder also runs setup.
 > exactly. Run `./lidkill install` as my signed-in desktop user without sudo, then
 > `~/.local/bin/lidkill doctor` and, if it flags anything, `~/.local/bin/lidkill doctor --fix`.
 > If it still fails, run `~/.local/bin/lidkill report` and give me its output.
-> Keep a fresh install disarmed. Do not close the lid, change power settings, request
+> Keep the install disarmed (you have no terminal to arm it; I will answer the arm prompt
+> myself). Do not close the lid, change power settings, request
 > my password, or reboot. Do not ask me questions: `AGENTS.md` covers the decisions.
 
 ## Configure in one minute
@@ -39,7 +43,7 @@ Pick whichever is easiest. Every route edits the same settings.
 
 ```bash
 lidkill setup               # answer five questions
-lidkill preset desk         # or a one-step preset: safe | desk | guard | battery
+lidkill preset desk         # or a one-step preset: default | safe | desk | guard | battery
 lidkill config              # see every setting and what it means
 lidkill set delay 5         # change one setting (same as: lidkill delay 5)
 ```
@@ -49,6 +53,7 @@ Or use the menu bar: **Presets**, **Lid Action**, **Delay**, **Only When**,
 
 | preset | does |
 |---|---|
+| `default` | factory behavior: clean power off after 1 s, always. Also clears dry-run, the hook and a pending skip. Use it to get back to "closing the lid shuts down". |
 | `safe` | clean power off after 5 s, with a notification |
 | `desk` | clean power off after 3 s, **ignored while an external display is connected** (clamshell-safe) |
 | `guard` | hard shutdown immediately, silent |
@@ -71,7 +76,7 @@ menu icon takes one slot and shows seconds during a countdown. Use **Launch at
 Sign-In** to control automatic launch and relaunch.
 
 `./lidkill menu` installs or repairs the menu from the checkout if needed and
-opens **Lidkill Controls**. Its button opens the same menu as the top-bar icon.
+opens the icon's menu. There is no separate window: Lidkill lives only in the top menu bar.
 
 Click the icon to arm or disarm, select any lid action, set a preset or custom
 delay, toggle dry run, or open the watcher log. Arming opens Terminal for the
@@ -79,10 +84,11 @@ administrator prompt; disarming needs no password once armed. **Setup Status**
 reports whether the app, icon, sign-in job, and lid watcher are healthy.
 **Copy Diagnostic Report** puts a redacted report on the clipboard for a bug report.
 
-**Icon hidden?** On a notched Mac with a full menu bar, macOS can hide new icons
-behind the notch. Lidkill detects that, adds a **Dock icon** and opens the
-**Lidkill Controls** window, which reaches every setting. Free some menu bar space
-(hold ⌘ and drag unused icons off the bar) and the menu bar icon takes over again.
+**Icon hidden?** On a notched Mac with a full menu bar, macOS hides icons that do not
+fit, newest first. Lidkill saves no icon position (a stale saved slot is one way an
+icon vanishes), checks that the icon is really on screen, and adds it again if not.
+If the bar is completely full, free space (⌘-drag unused icons off the bar) and it
+appears by itself.
 
 Choose **Preview Countdown** to try the icon countdown and Cancel without
 arming. An armed watcher shows its countdown for delays above zero.
@@ -227,8 +233,8 @@ AI agents: follow [AGENTS.md](AGENTS.md).
 ```
 
 - **Menu icon missing** — `doctor` says whether the icon is hidden and why. On a
-  notched Mac use the Dock icon, or free menu bar space and run
-  `~/.local/bin/lidkill menu`. If sign-in launch is blocked, check **System
+  notched Mac the bar is full: ⌘-drag unused icons off it and Lidkill's icon
+  appears by itself. If sign-in launch is blocked, check **System
   Settings → General → Login Items & Extensions** (macOS 13 or later), allow the
   Lidkill background item, then run `~/.local/bin/lidkill login on`.
 - **"CLI Unavailable" in the menu** — usually a second `Lidkill.app` (for example

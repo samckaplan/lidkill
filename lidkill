@@ -67,9 +67,10 @@ ${B}lidkill${N} $VERSION - closing the lid powers the machine off.
 Usage: lidkill <command>
 
 Set up
-  install [--force]    install or update Lidkill and open its menu bar app (no sudo)
+  install [--force]    install or update Lidkill and open its menu bar app (no sudo);
+                       in Terminal it then offers to arm (--arm / --no-arm skip the question)
   setup                answer a few questions to configure everything
-  preset <name>        one-step setups: safe | desk | guard | battery
+  preset <name>        one-step setups: default | safe | desk | guard | battery
   config               show every setting (set one with: lidkill set <name> <value>)
   update               pull the latest version of your clone and reinstall
 
@@ -95,7 +96,7 @@ Settings (also: lidkill set <name> <value>)
   login <on|off>       start the menu bar app automatically at sign-in
 
 Troubleshooting
-  menu                 set up if needed and open the menu bar controls
+  menu                 set up if needed and open the menu bar icon's menu
   doctor [--fix]       report menu app, icon, sign-in agent and watcher; --fix repairs
   report               write a redacted diagnostic report and copy it to the clipboard
   version              print the version
@@ -311,10 +312,10 @@ icon_state() {
 icon_advice() {
     cat <<EOF
   The menu bar icon is hidden ($(menu_state_get reason)). On a Mac with a notch, macOS
-  hides the rightmost-added icons when the bar is full. Lidkill switched to a
-  Dock icon + Lidkill Controls window so you can still reach every setting.
-  To get the icon back: hold ⌘ and drag unused icons off the bar, or turn items off
-  in System Settings > Control Center / Menu Bar, then run: lidkill menu
+  hides icons that do not fit. Lidkill already moved its icon to the far-right slot and
+  is still hidden, so the bar itself is full. Free space: hold ⌘ and drag unused icons
+  off the bar, or turn items off in System Settings > Control Center / Menu Bar. The
+  icon appears by itself; every setting also works from the command line (lidkill config).
 EOF
 }
 
@@ -327,8 +328,16 @@ source_hash() {
 # ---------------------------------------------------------------- commands
 
 cmd_install() {
-    local assets helper menu_asset updating=0 macos pid tries force=0 hash build_menu=1 build_helper=1 stray
-    [ "${1:-}" = --force ] && force=1
+    local assets helper menu_asset updating=0 macos pid tries force=0 hash build_menu=1 build_helper=1 stray arm=ask
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=1 ;;
+            --arm) arm=arm ;;
+            --no-arm) arm=no-arm ;;
+            *) die "usage: lidkill install [--force] [--arm|--no-arm]" ;;
+        esac
+        shift
+    done
     [ "$(/usr/bin/uname -s)" = Darwin ] || die "Lidkill requires macOS 12 or later"
     macos=$(/usr/bin/sw_vers -productVersion) || die "cannot read macOS version"
     [ "${macos%%.*}" -ge 12 ] || die "Lidkill requires macOS 12 or later"
@@ -414,6 +423,7 @@ cmd_install() {
         cat >"$CFG" <<'EOF'
 # lidkill settings - change them with `lidkill set <name> <value>`, `lidkill setup`,
 # or the menu bar. `lidkill config` explains every one.
+# Defaults: once armed, closing the lid powers the Mac off after 1 second, always.
 # MODE: poweroff | reboot | hard | hard-restart | nuke
 MODE=poweroff
 # seconds the lid must stay closed before firing
@@ -487,6 +497,30 @@ EOF
         echo
     fi
     printf '  Configure with: %s setup   |   Check health: %s doctor\n' "$BIN" "$BIN"
+    offer_arm "$arm"
+}
+
+# Closing the lid powers the Mac off by default, so an install you run in Terminal ends by
+# offering to arm. Scripts and agents have no terminal: they stay disarmed.
+offer_arm() {   # arm | no-arm | ask
+    local answer=y
+    [ "$1" != no-arm ] || return 0
+    if [ "$1" = ask ]; then
+        { [ -t 0 ] && [ -t 1 ] && [ -z "${LIDKILL_NO_PROMPT:-}" ]; } || return 0
+    fi
+    load_cfg
+    echo
+    if [ "$1" = ask ]; then
+        if agent_loaded; then
+            read -r -p "Lidkill is armed. Re-arm now to apply this update? Your password is needed once. [Y/n] " answer || answer=n
+        else
+            read -r -p "Arm now, so closing the lid powers the Mac off ($MODE, ${DELAY}s)? Your password is needed once. [Y/n] " answer || answer=n
+        fi
+    fi
+    case "$answer" in
+        ''|y|Y|yes|YES) ( cmd_on ) || warn "not armed. Arm later with: $BIN on" ;;
+        *) echo "Not armed. Arm later with: $BIN on  (or the menu bar icon > Arm)" ;;
+    esac
 }
 
 cmd_on() {
@@ -720,7 +754,7 @@ cmd_config() {
     printf '  %-9s %-14s %s\n' notify "$(onoff "$NOTIFY")" "on = notification and sound when a countdown starts"
     printf '  %-9s %-14s %s\n' hook "${HOOK:-off}" "script run just before the action"
     echo
-    echo "Quick start: lidkill preset safe|desk|guard|battery   or   lidkill setup"
+    echo "Quick start: lidkill preset default|safe|desk|guard|battery   or   lidkill setup"
 }
 
 apply_preset() {
@@ -730,6 +764,10 @@ apply_preset() {
 
 cmd_preset() {
     case "${1:-}" in
+        default)
+            apply_preset poweroff 1 any 0 0
+            set_cfg DRYRUN 0; set_cfg HOOK ""; /bin/rm -f "$SKIP"
+            [ ! -s "$PAGE_URL" ] || warn "Lid Page is on and uses its own action. Turn it off in the menu: Lid Page > Disable Lid Page" ;;
         safe)    apply_preset poweroff 5 any 0 1 ;;
         desk)    apply_preset poweroff 3 any 1 1 ;;
         guard)   apply_preset hard 0 any 0 0 ;;
@@ -737,15 +775,17 @@ cmd_preset() {
         ''|list)
             cat <<'EOF'
 Presets (lidkill preset <name>):
+  default  the factory behavior: closing the lid powers off after 1s, always (also
+           clears dry-run, the hook and a pending skip)
   safe     clean power off after 5s, with a notification
   desk     clean power off after 3s, but ignored while an external display is
            connected - safe for clamshell use at a desk
   guard    hard shutdown immediately, silent - for a locked-down, unattended Mac
   battery  clean power off after 3s, only when running on battery
-Presets never change dry-run, the hook, or the Lid Page website.
+Only "default" changes dry-run and the hook; no preset touches the Lid Page website.
 EOF
             return 0 ;;
-        *) die "unknown preset '$1'. Choose safe, desk, guard or battery." ;;
+        *) die "unknown preset '$1'. Choose default, safe, desk, guard or battery." ;;
     esac
     ok "preset $1 applied"
     cmd_config
@@ -865,7 +905,7 @@ doctor_fix() {
     done < <(duplicate_apps deep)
     [ "$moved" = 0 ] || /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -gc >/dev/null 2>&1 || true
     /usr/bin/defaults delete "$MENU_LABEL" >/dev/null 2>&1 && echo "  cleared saved menu bar position"
-    cmd_install --force || die "reinstall failed"
+    cmd_install --force --no-arm || die "reinstall failed"
 }
 
 cmd_doctor() {
@@ -891,8 +931,8 @@ cmd_doctor() {
             case "$icon" in
                 visible) echo "Menu icon: visible" ;;
                 hidden)
-                    printf 'Menu icon: HIDDEN (%s) - Dock icon and Controls window are active\n' "$(menu_state_get reason)"
-                    hints+=("Free menu bar space: hold ⌘ and drag unused icons off the bar, then run: lidkill menu") ;;
+                    printf 'Menu icon: HIDDEN (%s) after %s repositions\n' "$(menu_state_get reason)" "$(menu_state_get repairs)"
+                    hints+=("Menu bar is full: hold ⌘ and drag unused icons off the bar (the icon then shows by itself)") ;;
                 *) echo "Menu icon: not checked yet" ;;
             esac
         else
