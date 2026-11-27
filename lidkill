@@ -1136,6 +1136,7 @@ cmd_uninstall() {
     fi
 
     /usr/bin/defaults delete "$MENU_LABEL" >/dev/null 2>&1
+    rm -f "$HOME/Library/Preferences/$MENU_LABEL.plist"
     rm -rf "$APP_DIR" "$AGENT" "$MENU_AGENT" "$CFG_DIR" "$BIN" "$LOG" "$MENU_LOG" \
         "$HOME/Library/Logs/lidkill-report.txt"
     rm -f /usr/local/bin/lidkill 2>/dev/null
