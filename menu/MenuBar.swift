@@ -41,6 +41,15 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previewWebsite: NSMenuItem!
     private var testWebsite: NSMenuItem!
     private var clearWebsite: NSMenuItem!
+    private var presetItem: NSMenuItem!
+    private var whenItem: NSMenuItem!
+    private var externalItem: NSMenuItem!
+    private var notifyItem: NSMenuItem!
+    private var armForItem: NSMenuItem!
+    private var iconHidden = false
+    private var iconReason = "ok"
+    private var timerLeft = 0
+    private var iconProbeTimer: Timer?
 
     private var pageURLFile: URL { configDirectory.appendingPathComponent("page-url") }
     private var configuredPageURL: URL? {
@@ -48,21 +57,19 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if let iconURL = Bundle.main.url(forResource: "Lidkill", withExtension: "png"),
-           let asset = NSImage(contentsOf: iconURL),
-           let source = asset.cgImage(forProposedRect: nil, context: nil, hints: nil),
-           let glyph = source.copy(maskingColorComponents: [128, 255, 128, 255, 128, 255]) {
-            let icon = NSImage(cgImage: glyph, size: NSSize(width: 17, height: 17))
-            icon.isTemplate = true
-            statusItem.button?.image = icon
+        // A saved position from an older build can park the icon where the notch hides it.
+        for key in UserDefaults.standard.dictionaryRepresentation().keys
+            where key.hasPrefix("NSStatusItem") && key.contains("Lidkill") {
+            UserDefaults.standard.removeObject(forKey: key)
         }
-        if statusItem.button?.image == nil {
+        if let icon = MenuBar.makeGlyph() {
+            statusItem.button?.image = icon
+        } else {
             statusItem.button?.image = NSImage(systemSymbolName: "power", accessibilityDescription: "Lidkill")
         }
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
         statusItem.button?.setAccessibilityLabel("Lidkill")
         statusItem.button?.toolTip = "Lidkill"
-        statusItem.autosaveName = "Lidkill"
         statusItem.behavior = []
         statusItem.isVisible = true
         menu.autoenablesItems = false
@@ -76,6 +83,10 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cancel = add("Cancel Pending Action", to: menu, action: #selector(cancelCountdown))
         menu.addItem(.separator())
         arm = add("Arm…", to: menu, action: #selector(toggleArmed))
+        armForItem = add("Arm For", to: menu)
+        armForItem.submenu = choices(
+            [("1 Hour", "1h"), ("4 Hours", "4h"), ("8 Hours", "8h")], action: #selector(armFor(_:))
+        )
         skipItem = add("Skip Next Lid Close", to: menu, action: #selector(toggleSkip))
         dryRunItem = add("Dry Run", to: menu, action: #selector(toggleDryRun))
         modeItem = add("Lid Action", to: menu)
@@ -92,6 +103,19 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let delays = delayItem.submenu {
             _ = add("Custom…", to: delays, action: #selector(setCustomDelay))
         }
+        whenItem = add("Only When", to: menu)
+        whenItem.submenu = choices(
+            [("Any Power Source", "any"), ("On Battery", "battery"), ("On AC Power", "ac")],
+            action: #selector(setWhen(_:))
+        )
+        externalItem = add("Ignore With External Display", to: menu, action: #selector(toggleExternal))
+        notifyItem = add("Notify Before Action", to: menu, action: #selector(toggleNotify))
+        presetItem = add("Presets", to: menu)
+        presetItem.submenu = choices(
+            [("Safe · 5s With Notice", "safe"), ("Desk · Ignore External Display", "desk"),
+             ("Guard · Instant Hard Shutdown", "guard"), ("Battery Only", "battery")],
+            action: #selector(applyPreset(_:))
+        )
         let pageMenu = NSMenu()
         pageMenu.autoenablesItems = false
         pageItem = add("Lid Page", to: menu)
@@ -107,9 +131,12 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = add("Preview Countdown", to: menu, action: #selector(preview))
         _ = add("Setup Status…", to: menu, action: #selector(showSetupStatus))
         _ = add("Open Log", to: menu, action: #selector(openLog))
-        for control in [arm, dryRunItem, modeItem, delayItem, loginItem, skipItem, reopenItem] {
+        _ = add("Copy Diagnostic Report", to: menu, action: #selector(copyReport))
+        for control in [arm, armForItem, dryRunItem, modeItem, delayItem, loginItem, skipItem, reopenItem,
+                        whenItem, externalItem, notifyItem, presetItem] {
             control?.isEnabled = false
         }
+        scheduleIconProbes()
 
         observeCountdown()
         reloadCountdown()
@@ -128,20 +155,167 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showControls() {
         if controlsWindow == nil {
-            let frame = NSRect(x: 0, y: 0, width: 260, height: 96)
+            let frame = NSRect(x: 0, y: 0, width: 300, height: 214)
             let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Lidkill Controls"
             window.isReleasedWhenClosed = false
-            let button = NSButton(title: "Open Lidkill Menu ▾", target: self, action: #selector(openControlsMenu(_:)))
-            button.bezelStyle = .rounded
-            button.frame = NSRect(x: 30, y: 30, width: 200, height: 36)
-            window.contentView?.addSubview(button)
-            window.initialFirstResponder = button
+            let note = NSTextField(wrappingLabelWithString: "")
+            note.frame = NSRect(x: 20, y: 140, width: 260, height: 58)
+            note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            note.identifier = NSUserInterfaceItemIdentifier("note")
+            window.contentView?.addSubview(note)
+            let first = NSButton(title: "Open Lidkill Menu ▾", target: self, action: #selector(openControlsMenu(_:)))
+            let buttons = [first,
+                           NSButton(title: "Setup Status…", target: self, action: #selector(showSetupStatus)),
+                           NSButton(title: "Copy Diagnostic Report", target: self, action: #selector(copyReport))]
+            for (index, button) in buttons.enumerated() {
+                button.bezelStyle = .rounded
+                button.frame = NSRect(x: 30, y: 96 - index * 38, width: 240, height: 32)
+                window.contentView?.addSubview(button)
+            }
+            window.initialFirstResponder = first
             window.center()
             controlsWindow = window
         }
+        let note = controlsWindow?.contentView?.subviews.first {
+            $0.identifier == NSUserInterfaceItemIdentifier("note")
+        } as? NSTextField
+        note?.stringValue = iconHidden
+            ? "The menu bar icon is hidden (\(iconReason)). Use these controls or the Dock icon. To restore the icon, free some menu bar space, then run: lidkill menu"
+            : "Lidkill lives in the menu bar. This window opens the same menu."
         NSApp.activate(ignoringOtherApps: true)
         controlsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if headline != nil { showControls() }
+        return true
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let dock = NSMenu()
+        for (title, action) in [("Open Lidkill Controls", #selector(showControlsAction)),
+                                (armed ? "Disarm…" : "Arm…", #selector(toggleArmed)),
+                                ("Setup Status…", #selector(showSetupStatus)),
+                                ("Copy Diagnostic Report", #selector(copyReport))] {
+            _ = add(title, to: dock, action: action)
+        }
+        return dock
+    }
+
+    @objc private func showControlsAction() { showControls() }
+
+    // MARK: menu bar icon
+
+    /// Black-on-white artwork -> template image whose alpha is the ink. Independent of
+    /// CGImage color masking, which behaved differently across macOS releases.
+    static func makeGlyph(url: URL? = Bundle.main.url(forResource: "Lidkill", withExtension: "png")) -> NSImage? {
+        guard let url, let asset = NSImage(contentsOf: url),
+              let source = asset.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let side = 34
+        let space = CGColorSpaceCreateDeviceRGB()
+        var pixels = [UInt8](repeating: 255, count: side * side * 4)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(data: buffer.baseAddress, width: side, height: side, bitsPerComponent: 8,
+                                          bytesPerRow: side * 4, space: space,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: side, height: side))
+            context.interpolationQuality = .high
+            context.draw(source, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
+        }
+        guard drawn else { return nil }
+        var ink = 0
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let luma = (Int(pixels[i]) * 77 + Int(pixels[i + 1]) * 150 + Int(pixels[i + 2]) * 29) >> 8
+            let alpha = UInt8(255 - luma)
+            pixels[i] = 0; pixels[i + 1] = 0; pixels[i + 2] = 0; pixels[i + 3] = alpha
+            if alpha > 40 { ink += 1 }
+        }
+        // Reject blank or solid results so a bad asset falls back to the system symbol.
+        guard ink > 8, ink < side * side * 3 / 4,
+              let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let glyph = CGImage(width: side, height: side, bitsPerComponent: 8, bitsPerPixel: 32,
+                                  bytesPerRow: side * 4, space: space,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        let icon = NSImage(cgImage: glyph, size: NSSize(width: 17, height: 17))
+        icon.isTemplate = true
+        return icon
+    }
+
+    /// Is the status item really on screen? A full menu bar on a notched Mac hides it.
+    private func probeStatusItem() -> (visible: Bool, reason: String, frame: NSRect?) {
+        guard statusItem.isVisible, let window = statusItem.button?.window else {
+            return (false, "macOS gave the status item no window", nil)
+        }
+        let frame = window.frame
+        if ProcessInfo.processInfo.environment["LIDKILL_FAKE_HIDDEN"] != nil { return (false, "simulated for testing", frame) }
+        guard let screen = window.screen ?? NSScreen.screens.first(where: { $0.frame.intersects(frame) }) else {
+            return (false, "the icon is not on any display", frame)
+        }
+        if screen.safeAreaInsets.top > 0, let left = screen.auxiliaryTopLeftArea,
+           let right = screen.auxiliaryTopRightArea {
+            let notch = NSRect(x: left.maxX, y: frame.minY, width: max(0, right.minX - left.maxX), height: frame.height)
+            if frame.intersects(notch.insetBy(dx: 1, dy: 0)) { return (false, "behind the notch", frame) }
+            // Status items live right of the notch; the left side belongs to the app menus.
+            if frame.midX < right.minX { return (false, "left of the notch", frame) }
+        }
+        if frame.maxX > screen.frame.maxX + 1 || frame.minX < screen.frame.minX - 1 || !window.isVisible {
+            return (false, "pushed off the menu bar", frame)
+        }
+        // occlusionState is deliberately not used: it reads "hidden" while the display sleeps or locks.
+        return (true, "ok", frame)
+    }
+
+    private func scheduleIconProbes() {
+        for delay in [1.5, 6.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.checkIcon() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.checkIcon() }
+        }
+    }
+
+    private func checkIcon() {
+        let probe = probeStatusItem()
+        iconReason = probe.reason
+        if !probe.visible && !iconHidden {
+            iconHidden = true
+            NSApp.setActivationPolicy(.regular)
+            if let url = Bundle.main.url(forResource: "Lidkill", withExtension: "png"),
+               let image = NSImage(contentsOf: url) { NSApp.applicationIconImage = image }
+            showControls()
+        } else if probe.visible && iconHidden {
+            iconHidden = false
+            NSApp.setActivationPolicy(.accessory)
+        }
+        // While the icon is hidden keep looking: the user may free some bar space.
+        if iconHidden, iconProbeTimer == nil {
+            iconProbeTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                self?.checkIcon()
+            }
+        } else if !iconHidden {
+            iconProbeTimer?.invalidate()
+            iconProbeTimer = nil
+        }
+        let f = probe.frame
+        let lines = [
+            "pid=\(getpid())",
+            "icon=\(probe.visible ? "visible" : "hidden")",
+            "reason=\(probe.reason)",
+            "mode=\(iconHidden ? "dock" : "menu-bar")",
+            "frame=\(f.map { "\(Int($0.minX)),\(Int($0.minY)),\(Int($0.width)),\(Int($0.height))" } ?? "none")",
+            "notch=\(NSScreen.screens.contains { $0.safeAreaInsets.top > 0 } ? "yes" : "no")",
+            "screens=\(NSScreen.screens.count)",
+            "occlusion=\(statusItem.button?.window?.occlusionState.rawValue ?? 0)",
+        ]
+        try? Data((lines.joined(separator: "\n") + "\n").utf8)
+            .write(to: configDirectory.appendingPathComponent("menu-state"), options: .atomic)
     }
 
     @objc private func openControlsMenu(_ button: NSButton) {
@@ -218,6 +392,10 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.loginItem.isEnabled = available && fields.count >= 5
             self.skipItem.isEnabled = available && fields.count >= 6
             self.reopenItem.isEnabled = available && fields.count >= 7 && hasPage
+            let extended = available && fields.count >= 11
+            for item in [self.whenItem, self.externalItem, self.notifyItem, self.presetItem] {
+                item?.isEnabled = extended
+            }
             guard available else {
                 self.headline.title = "Lidkill · CLI Unavailable"
                 return
@@ -225,7 +403,20 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.armed = fields[0] == "1"
             self.dryRun = fields[3] == "1"
             self.launchAtSignIn = fields.dropFirst(4).first == "1"
-            self.headline.title = self.armed ? "Lidkill · Armed" : "Lidkill · Disarmed"
+            if extended {
+                self.timerLeft = Int(fields[10]) ?? 0
+                self.externalItem.state = fields[8] == "1" ? .on : .off
+                self.notifyItem.state = fields[9] == "1" ? .on : .off
+                let when = String(fields[7])
+                if let choices = self.whenItem.submenu?.items {
+                    self.whenItem.title = "Only When · " +
+                        (choices.first { $0.representedObject as? String == when }?.title ?? when)
+                    for choice in choices { choice.state = choice.representedObject as? String == when ? .on : .off }
+                }
+            }
+            self.armForItem.isEnabled = extended && !self.armed
+            let remaining = self.armed && self.timerLeft > 0 ? " · \(MenuBar.format(self.timerLeft)) left" : ""
+            self.headline.title = (self.armed ? "Lidkill · Armed" : "Lidkill · Disarmed") + remaining
             self.arm.title = self.armed ? "Disarm…" : "Arm…"
             self.dryRunItem.state = self.dryRun ? .on : .off
             self.loginItem.state = self.launchAtSignIn ? .on : .off
@@ -379,8 +570,8 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func toggleArmed() {
-        guard let script = Bundle.main.url(forResource: armed ? "off" : "on", withExtension: "command"),
+    private func openInTerminal(_ name: String) {
+        guard let script = Bundle.main.url(forResource: name, withExtension: "command"),
               let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
         else {
             showMessage("Terminal is required for the administrator prompt.")
@@ -391,6 +582,46 @@ final class MenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DispatchQueue.main.async { self?.showMessage(error.localizedDescription) }
             }
         }
+    }
+
+    @objc private func toggleArmed() {
+        guard armed else { openInTerminal("on"); return }
+        // The sudoers rule installed when arming allows a prompt-free disarm.
+        run(["off", "--no-prompt"]) { [weak self] status, _ in
+            guard let self else { return }
+            if status == 0 { self.refreshSettings(); self.reloadCountdown() } else { self.openInTerminal("off") }
+        }
+    }
+
+    @objc private func armFor(_ sender: NSMenuItem) {
+        if let span = sender.representedObject as? String { openInTerminal("on-" + span) }
+    }
+
+    @objc private func setWhen(_ sender: NSMenuItem) {
+        if let value = sender.representedObject as? String { update(["when", value]) }
+    }
+
+    @objc private func applyPreset(_ sender: NSMenuItem) {
+        if let value = sender.representedObject as? String { update(["preset", value]) }
+    }
+
+    @objc private func toggleExternal() { update(["external", externalItem.state == .on ? "off" : "on"]) }
+
+    @objc private func toggleNotify() { update(["notify", notifyItem.state == .on ? "off" : "on"]) }
+
+    @objc private func copyReport() {
+        run(["report", "--stdout"]) { [weak self] status, report in
+            guard status == 0 else { self?.showMessage(report); return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(report, forType: .string)
+            self?.showMessage("The diagnostic report is on your clipboard. Paste it into your bug report. Your user name and home folder are removed.")
+        }
+    }
+
+    static func format(_ seconds: Int) -> String {
+        if seconds >= 3600 { return "\(seconds / 3600)h \(seconds % 3600 / 60)m" }
+        if seconds >= 60 { return "\(seconds / 60)m" }
+        return "\(seconds)s"
     }
 
     @objc private func toggleDryRun() { update(["dryrun", dryRun ? "off" : "on"]) }

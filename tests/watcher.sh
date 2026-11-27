@@ -141,4 +141,78 @@ await_log "lid no longer confirmed closed - aborted"
 [ ! -e "$tmp/pending" ]
 [ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 1 ]
 
+
+# ---- conditions, hook, arm timer (standard profile) ----
+kill "$pid"
+wait "$pid" || true
+pid=
+rm -f "$tmp/page-url" "$tmp/pending" "$tmp/skip-next"
+export LIDKILL_NO_NOTIFY=1
+
+restart() {  # restart <extra env...>: fresh watcher, fresh log, lid open
+    if [ -n "$pid" ]; then kill "$pid"; wait "$pid" || true; pid=; fi
+    : >"$LIDKILL_LOG"
+    lid open
+    env "$@" /bin/bash ./watcher.sh &
+    pid=$!
+}
+
+printf 'MODE=poweroff\nDELAY=0\nWHEN_POWER=battery\n' >"$tmp/new-config"; mv "$tmp/new-config" "$LIDKILL_CONFIG"
+restart LIDKILL_FAKE_POWER=ac
+await_log "when=battery"
+lid closed
+await_log "ignored lid close: on ac power, rule is battery only"
+[ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 0 ]
+lid open
+restart LIDKILL_FAKE_POWER=battery
+await_log "when=battery"
+lid closed
+await_log "DRY RUN: would execute /sbin/shutdown -h now"
+
+printf 'MODE=poweroff\nDELAY=0\nIGNORE_EXTERNAL=1\n' >"$tmp/new-config"; mv "$tmp/new-config" "$LIDKILL_CONFIG"
+restart LIDKILL_FAKE_DISPLAYS=1
+await_log "ignore_external=1"
+lid closed
+await_log "ignored lid close: external display connected"
+[ "$(grep -c 'DRY RUN: would execute' "$LIDKILL_LOG")" -eq 0 ]
+lid open
+restart LIDKILL_FAKE_DISPLAYS=0
+await_log "ignore_external=1"
+lid closed
+await_log "DRY RUN: would execute /sbin/shutdown -h now"
+
+# Hook: dry run only logs it; with the test switch it really runs, and is stopped at its time limit.
+printf '#!/bin/bash\necho "hook ran in $LIDKILL_MODE" >"%s/hook-ran"\n' "$tmp" >"$tmp/hook.sh"
+printf '#!/bin/bash\nsleep 30\n' >"$tmp/slow-hook.sh"
+chmod +x "$tmp/hook.sh" "$tmp/slow-hook.sh"
+printf 'MODE=reboot\nDELAY=0\nHOOK=%s\n' "$tmp/hook.sh" >"$tmp/new-config"; mv "$tmp/new-config" "$LIDKILL_CONFIG"
+restart
+await_log "lid=open"
+lid closed
+await_log "DRY RUN: would run hook $tmp/hook.sh"
+await_log "DRY RUN: would execute /sbin/shutdown -r now"
+[ ! -e "$tmp/hook-ran" ]
+restart LIDKILL_TEST_HOOK=1
+await_log "lid=open"
+lid closed
+await_log "hook exit status 0"
+[ "$(cat "$tmp/hook-ran")" = "hook ran in reboot" ]
+printf 'MODE=reboot\nDELAY=0\nHOOK=%s\nHOOK_TIMEOUT=1\n' "$tmp/slow-hook.sh" >"$tmp/new-config"; mv "$tmp/new-config" "$LIDKILL_CONFIG"
+restart LIDKILL_TEST_HOOK=1
+await_log "lid=open"
+lid closed
+await_log "hook timed out after 1s"
+await_log "DRY RUN: would execute /sbin/shutdown -r now"
+
+# Arm timer: an expired timer disarms (a dry run only logs it) and clears itself.
+printf 'MODE=poweroff\nDELAY=0\n' >"$tmp/new-config"; mv "$tmp/new-config" "$LIDKILL_CONFIG"
+printf '%s\n' "$(($(date +%s) + 2))" >"$tmp/arm-until"
+restart
+await_log "arm timer expired"
+await_log "DRY RUN: would disarm"
+[ ! -e "$tmp/arm-until" ]
+# The watcher keeps working after a dry-run expiry.
+lid closed
+await_log "DRY RUN: would execute /sbin/shutdown -h now"
+
 echo "Watcher dry-run checks passed"

@@ -29,6 +29,10 @@ jobs:
         run: |
           xcrun swiftc -swift-version 5 menu/MenuBar.swift menu/LidPage.swift tests/menu.swift -o "$RUNNER_TEMP/lidkill-menu-smoke"
           "$RUNNER_TEMP/lidkill-menu-smoke"
+      - name: Menu falls back to the Dock when the icon is hidden
+        run: LIDKILL_FAKE_HIDDEN=1 LIDKILL_EXPECT_FALLBACK=1 "$RUNNER_TEMP/lidkill-menu-smoke"
+      - name: Exercise settings commands
+        run: bash tests/cli.sh
       - name: Exercise watcher with simulated lid events
         if: ${{ !cancelled() }}
         run: bash tests/watcher.sh

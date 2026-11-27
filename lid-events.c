@@ -1,3 +1,4 @@
+#include <ApplicationServices/ApplicationServices.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOMessage.h>
@@ -5,6 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static int last_state = -1;
 
@@ -27,9 +29,26 @@ static void lid_changed(void *context, io_service_t service, natural_t message, 
         CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
-int main(void)
+/* Prints how many non-built-in displays are connected (mirrored ones included). */
+static int print_external_displays(void)
+{
+    CGDirectDisplayID ids[16];
+    uint32_t count = 0;
+    int external = 0;
+    if (CGGetOnlineDisplayList(16, ids, &count) != kCGErrorSuccess)
+        return 1;
+    for (uint32_t i = 0; i < count; i++)
+        if (!CGDisplayIsBuiltin(ids[i]))
+            external++;
+    printf("%d\n", external);
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     int status = 1;
+    if (argc > 1 && strcmp(argv[1], "--displays") == 0)
+        return print_external_displays();
     io_service_t domain = IOServiceGetMatchingService(MACH_PORT_NULL,
                                                       IOServiceMatching("IOPMrootDomain"));
     if (!domain)
