@@ -1088,7 +1088,7 @@ cmd_uninstall() {
         [ "$slept" = 1 ] || /usr/bin/sudo /usr/bin/pmset -a disablesleep 0 || warn "could not reset pmset"
         /usr/bin/sudo rm -f "$SUDOERS"
     else
-        [ "$slept" = 1 ] || warn "could not restore sleep; run: sudo pmset -a disablesleep 0"
+        [ "$slept" = 1 ] || [ "$(sleep_disabled)" != 1 ] || warn "could not restore sleep; run: sudo pmset -a disablesleep 0"
         [ ! -f "$SUDOERS" ] || warn "left the harmless sudoers rule; remove it with: sudo rm -f $SUDOERS"
     fi
 
